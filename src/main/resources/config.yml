@@ -1,0 +1,9 @@
+# Maximum blocks in an arena snapshot to prevent accidental huge saves.
+max-snapshot-blocks: 250000
+reset-blocks-per-tick: 1200
+# A match arena world has its own worldborder. Shrinking starts after 8 minutes.
+border:
+  enabled: true
+  delay-seconds: 480
+  shrink-seconds: 180
+  final-size: 10
