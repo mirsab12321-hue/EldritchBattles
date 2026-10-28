@@ -35,6 +35,7 @@ import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -45,6 +46,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
     private final Map<UUID, Match> playing = new HashMap<>();
     private final Map<String, Arena> arenas = new LinkedHashMap<>();
     private final Map<String, Kit> kits = new LinkedHashMap<>();
+    private final Map<String, Material> kitIcons = new HashMap<>();
     private final Map<UUID, UUID> invitations = new HashMap<>();
     private File arenaFile, kitsFile, recoveryFile;
     private YamlConfiguration arenaYaml, kitsYaml, recoveryYaml;
@@ -139,7 +141,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         recoveryYaml=YamlConfiguration.loadConfiguration(recoveryFile);
         loadKits(); loadArenas();
         getServer().getPluginManager().registerEvents(this,this);
-        getLogger().info("Eldritch Battles v0.1.0 enabled. Use /eb help");
+        getLogger().info("Eldritch Battles v0.1.2 enabled. Use /eb help");
     }
     @Override public void onDisable(){
         for(Match match: new HashSet<>(playing.values())){
@@ -160,8 +162,10 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
     private void help(Player p){
         msg(p,"&e/eb party create | invite <player> | join <host> | leave | list | menu");
         msg(p,"&e/eb kit save <name> | list | delete <name> &7(admin)");
+        msg(p,"&eHold an item and use /eb kit icon <name> &7(admin)");
         msg(p,"&e/eb arena create <name> | edit <name> | pos1 <name> | pos2 <name>");
-        msg(p,"&e/eb arena spawn <name> <1-16> | save <name> | list &7(admin)");
+        msg(p,"&e/eb arena spawn <name> <1|2> &7(Team 1 / Team 2; FFA is random)");
+        msg(p,"&e/eb arena save <name> | list &7(admin)");
         msg(p,"&e/eb menu &7(open your team/kit/settings UI)");
     }
     @Override public boolean onCommand(CommandSender sender,Command command,String label,String[] args){
@@ -230,7 +234,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
     }
     private boolean isLeader(Player p,Party party){return party!=null&&party.owner.equals(p.getUniqueId());}
     private void kitCommand(Player p,String[] a){
-        if(a.length==0){msg(p,"&e/eb kit save <name> | list | delete <name>");return;}
+        if(a.length==0){msg(p,"&e/eb kit save <name> | list | delete <name> | icon <name> [item]");return;}
         if(a[0].equalsIgnoreCase("list")){msg(p,"&eSaved kits: "+String.join(", ",kits.keySet()));return;}
         if(!admin(p))return;
         if(a.length<2){msg(p,"&cSpecify kit name, e.g. /eb kit save sword");return;}
@@ -239,8 +243,26 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
             PlayerInventory inv=p.getInventory();
             kits.put(id,new Kit(inv.getStorageContents(),inv.getArmorContents(),inv.getItemInOffHand()));
             saveKits();msg(p,"&aSaved kit '&f"+id+"&a' including empty slots, armour and offhand.");
+        }else if(a[0].equalsIgnoreCase("icon")){
+            if(!kits.containsKey(id)){msg(p,"&cSave that kit first using /eb kit save " + id);return;}
+            Material material;
+            if(a.length>=3){
+                material=Material.matchMaterial(a[2]);
+                if(material==null || !material.isItem() || material.isAir()){
+                    msg(p,"&cUnknown icon item. Example: /eb kit icon " + id + " mace");return;
+                }
+            }else{
+                ItemStack held=p.getInventory().getItemInMainHand();
+                if(held.getType().isAir()){
+                    msg(p,"&cHold the item you want as the kit icon first.");return;
+                }
+                material=held.getType();
+            }
+            kitIcons.put(id,material);
+            saveKits();
+            msg(p,"&aSet the '&f"+id+"&a' menu icon to &f"+material.name()+"&a. Reopen /eb menu to see it.");
         }else if(a[0].equalsIgnoreCase("delete")){
-            kits.remove(id);saveKits();msg(p,"&eKit deleted.");
+            kits.remove(id);kitIcons.remove(id);saveKits();msg(p,"&eKit deleted.");
         }else msg(p,"&cUnknown kit command.");
     }
     private String validId(String id){id=id.toLowerCase(Locale.ROOT);return id.matches("[a-z0-9_-]{1,24}")?id:null;}
@@ -293,7 +315,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
                 try{n=Integer.parseInt(a[2]);}catch(NumberFormatException e){msg(p,"&cSpawn must be a number.");return;}
                 if(n<1||n>16){msg(p,"&cUse 1-16.");return;}
                 while(ar.spawns.size()<n)ar.spawns.add(null);
-                ar.spawns.set(n-1,p.getLocation().clone());saveArenas();msg(p,"&aSpawn "+n+" saved.");
+                ar.spawns.set(n-1,p.getLocation().clone());saveArenas();msg(p,"&aSpawn "+n+" saved"+(n<=2?" for Team "+n:" (legacy extra spawn)")+".");
             }
             case "save" -> {
                 if(ar.first==null||ar.second==null||ar.spawns.size()<2||ar.spawns.contains(null)){
@@ -399,6 +421,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
             kitsYaml.set(name+".storage",Arrays.asList(kit.storage));
             kitsYaml.set(name+".armor",Arrays.asList(kit.armor));
             kitsYaml.set(name+".offhand",kit.offhand);
+            if(kitIcons.containsKey(name))kitsYaml.set(name+".icon",kitIcons.get(name).name());
         }
         try{kitsYaml.save(kitsFile);}catch(IOException e){getLogger().severe("kits.yml save failed: "+e);}
     }
@@ -407,9 +430,15 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         return arr;
     }
     private void loadKits(){
-        kits.clear();for(String id:kitsYaml.getKeys(false)){
+        kits.clear();kitIcons.clear();
+        for(String id:kitsYaml.getKeys(false)){
             kits.put(id,new Kit(readItems(kitsYaml.getList(id+".storage",Collections.emptyList())),
                 readItems(kitsYaml.getList(id+".armor",Collections.emptyList())), kitsYaml.getItemStack(id+".offhand")));
+            String iconName=kitsYaml.getString(id+".icon");
+            if(iconName!=null){
+                Material icon=Material.matchMaterial(iconName);
+                if(icon!=null && icon.isItem() && !icon.isAir())kitIcons.put(id,icon);
+            }
         }
     }
     private void saveArenas(){
@@ -473,8 +502,9 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
             int i=0;
             for(String id:kits.keySet()){
                 if(i>=45)break;
-                Material icon= id.contains("pot")?Material.SPLASH_POTION:id.contains("mace")?Material.MACE:
+                Material defaultIcon= id.contains("pot")?Material.SPLASH_POTION:id.contains("mace")?Material.MACE:
                     id.contains("crystal")?Material.END_CRYSTAL:id.contains("uhc")?Material.GOLDEN_APPLE:Material.DIAMOND_SWORD;
+                Material icon=kitIcons.getOrDefault(id,defaultIcon);
                 action(menu,i++,"kit:"+id,button(icon,"&6"+id, "&7Click to choose kit"));
             }
             action(menu,45,"back",button(Material.RED_STAINED_GLASS_PANE,"&cBack"));
@@ -555,7 +585,9 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         Arena arena=arenas.get(party.arena);
         if(arena==null||!arena.ready()){msg(owner,"&cChoose a saved arena first.");return;}
         if(arena.busy){msg(owner,"&cArena already in use.");return;}
-        if(arena.spawns.size()<party.teams.size()){msg(owner,"&cSet at least "+party.teams.size()+" spawn points for this arena.");return;}
+        if(arena.spawns.size()<2 || arena.spawns.get(0)==null || arena.spawns.get(1)==null){
+            msg(owner,"&cSet Team 1 and Team 2 spawn points with /eb arena spawn "+arena.id+" 1/2.");return;
+        }
         arena.busy=true;
         Match m=new Match(party,arena,kits.get(party.kit));party.match=m;
         for(UUID u:party.teams.keySet()){
@@ -576,9 +608,15 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         resetArena(m.arena,()->{
             if(m.ending)return;
             m.round++;m.eliminated.clear();
-            List<UUID> playerOrder=new ArrayList<>(m.party.teams.keySet());
-            for(int i=0;i<playerOrder.size();i++){
-                Player p=Bukkit.getPlayer(playerOrder.get(i));if(p==null){m.eliminated.add(playerOrder.get(i));continue;}
+            // Team battles use only two saved team anchors; FFA finds fresh safe floor spots every round.
+            Map<UUID,Location> positions=chooseRoundSpawns(m);
+            if(positions==null){
+                partyMsg(m.party,"&cCannot find enough safe spawn locations on this arena's floor."
+                    +" &eMove Team 1/2 spawns to the fighting floor, then try again.");
+                abortMatch(m);return;
+            }
+            for(UUID uuid:m.party.teams.keySet()){
+                Player p=Bukkit.getPlayer(uuid);if(p==null){m.eliminated.add(uuid);continue;}
                 PlayerInventory inv=p.getInventory();inv.clear();
                 inv.setStorageContents(cloneItems(m.kit.storage));
                 inv.setArmorContents(cloneItems(m.kit.armor));
@@ -587,7 +625,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
                 p.setFireTicks(0);p.setFallDistance(0);
                 p.setHealth(p.getAttribute(org.bukkit.attribute.Attribute.MAX_HEALTH)==null?20.0:
                     p.getAttribute(org.bukkit.attribute.Attribute.MAX_HEALTH).getValue());
-                p.teleport(m.arena.spawns.get(i));
+                p.teleport(positions.get(uuid));
             }
             partyMsg(m.party,"&eRound "+m.round+" of BO"+m.party.bestOf+" begins in 5 seconds!");
             // Freeze by cancelling PvP damage while countdown is active.
@@ -612,6 +650,92 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
             // Mark a quit during preparation as a forfeit.
             Bukkit.getScheduler().runTaskLater(this,()->checkRound(m),101L);
         });
+    }
+    /** Only choose level, solid, non-hazardous floor with space for the player and their head. */
+    private boolean isSafeArenaSpawn(Arena a,Location at){
+        if(at==null || !a.inside(at) || at.getWorld()==null)return false;
+        int x=at.getBlockX(),y=at.getBlockY(),z=at.getBlockZ();
+        World world=at.getWorld();
+        if(y<=world.getMinHeight() || y+1>=world.getMaxHeight())return false;
+        Material floor=world.getBlockAt(x,y-1,z).getType();
+        if(!floor.isSolid() || floor==Material.MAGMA_BLOCK || floor==Material.CACTUS ||
+            floor==Material.CAMPFIRE || floor==Material.SOUL_CAMPFIRE)return false;
+        return world.getBlockAt(x,y,z).getType().isAir() && world.getBlockAt(x,y+1,z).getType().isAir();
+    }
+    private boolean separated(Location candidate,List<Location> used,double minDistance){
+        for(Location other:used){
+            if(other.getWorld()==candidate.getWorld() && other.distanceSquared(candidate)<minDistance*minDistance)
+                return false;
+        }
+        return true;
+    }
+    /** Spawn teammates near their own anchor, not at exactly the same block. */
+    private Location nearTeamAnchor(Arena a,Location anchor,List<Location> used){
+        if(isSafeArenaSpawn(a,anchor) && separated(anchor,used,2.0))return anchor.clone();
+        ThreadLocalRandom rng=ThreadLocalRandom.current();
+        for(int radius=2;radius<=8;radius++){
+            for(int attempt=0;attempt<35;attempt++){
+                double angle=rng.nextDouble(Math.PI*2);
+                int x=anchor.getBlockX()+(int)Math.round(radius*Math.cos(angle));
+                int z=anchor.getBlockZ()+(int)Math.round(radius*Math.sin(angle));
+                for(int yOffset : new int[]{0,1,-1,2,-2}){
+                    Location candidate=new Location(anchor.getWorld(),x+0.5,anchor.getBlockY()+yOffset,z+0.5,
+                        anchor.getYaw(),anchor.getPitch());
+                    if(isSafeArenaSpawn(a,candidate) && separated(candidate,used,2.0))return candidate;
+                }
+            }
+        }
+        return null;
+    }
+    /** Pick independent FFA floor positions from the rectangular arena selection, not from empty void. */
+    private Location randomFfaSpawn(Arena a,Location reference,List<Location> used){
+        ThreadLocalRandom rng=ThreadLocalRandom.current();
+        int marginX=(a.maxX()-a.minX())>10?2:0;
+        int marginZ=(a.maxZ()-a.minZ())>10?2:0;
+        int minX=a.minX()+marginX,maxX=a.maxX()-marginX;
+        int minZ=a.minZ()+marginZ,maxZ=a.maxZ()-marginZ;
+        // Keep FFA players at approximately the same floor height as the team spawn markers.
+        // This avoids placing players on castle rooftops or unrelated structures.
+        for(double minDistance:new double[]{8.0,5.0,2.0}){
+            for(int attempt=0;attempt<500;attempt++){
+                int x=rng.nextInt(minX,maxX+1),z=rng.nextInt(minZ,maxZ+1);
+                for(int offset:new int[]{0,1,-1,2,-2}){
+                    Location candidate=new Location(reference.getWorld(),x+0.5,reference.getBlockY()+offset,z+0.5,
+                        rng.nextFloat()*360f,0f);
+                    if(isSafeArenaSpawn(a,candidate) && separated(candidate,used,minDistance))return candidate;
+                }
+            }
+        }
+        return null;
+    }
+    private Map<UUID,Location> chooseRoundSpawns(Match match){
+        Arena arena=match.arena;
+        Map<UUID,Location> chosen=new LinkedHashMap<>();
+        List<Location> used=new ArrayList<>();
+        for(Map.Entry<UUID,Integer> e:match.party.teams.entrySet()){
+            Location selected;
+            if(match.party.ffa){
+                selected=randomFfaSpawn(arena,arena.spawns.get(0),used);
+            }else{
+                int team=e.getValue();
+                if(team!=1 && team!=2)return null;
+                selected=nearTeamAnchor(arena,arena.spawns.get(team-1),used);
+            }
+            if(selected==null)return null;
+            chosen.put(e.getKey(),selected);used.add(selected);
+        }
+        return chosen;
+    }
+    private void abortMatch(Match m){
+        m.ending=true;
+        for(BukkitTask task:m.tasks)task.cancel();m.tasks.clear();
+        for(UUID u:m.party.teams.keySet()){
+            playing.remove(u);
+            Player p=Bukkit.getPlayer(u);PlayerBackup b=m.backups.get(u);
+            if(p!=null && b!=null && !p.isDead())restore(p,b);
+        }
+        m.party.match=null;m.arena.busy=false;
+        m.arena.world().getWorldBorder().reset();
     }
     @EventHandler public void damage(EntityDamageByEntityEvent event){
         if(!(event.getEntity() instanceof Player hurt))return;
