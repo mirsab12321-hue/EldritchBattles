@@ -720,7 +720,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
                 "&7Left click: choose number of rounds","&7Shift click: infinite rounds"));
             action(menu,13,"arenaMenu",button(Material.GRASS_BLOCK,"&eArena: "+(party.arena==null?"RANDOM":party.arena),
                 "&7Choose random or select an arena"));
-            action(menu,16,"duelSettings",button(Material.CHAIN,"&6Duel Settings",
+            action(menu,16,"duelSettings",button(Material.IRON_BARS,"&6Duel Settings",
                 "&7Health, shield stuns, blocks, friendly fire","&7Drops and shrinking border"));
             action(menu,45,"kits",button(Material.BARRIER,"&cBack to Kits"));
             action(menu,53,"start",button(Material.LIME_CONCRETE,"&aSTART MATCH",
