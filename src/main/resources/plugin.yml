@@ -1,15 +1,21 @@
 name: EldritchBattles
-version: '0.1.2'
+version: '0.2.0'
 main: dev.eldritch.battles.EldritchBattles
 api-version: '1.21.11'
 author: Eldritch Champions
-description: Standalone custom team, FFA, kit and resettable arena plugin.
+description: Experimental standalone PvP duels, parties, kits, reports and resettable arenas.
 commands:
   eb:
     description: Main Eldritch Battles command
     usage: /eb help
     aliases: [eldritchbattle]
+  duel:
+    description: Challenge another player to a direct 1v1 duel
+    usage: /duel <player> (or /eb duel <player>)
+  party:
+    description: Manage Eldritch parties
+    usage: /party create|invite|join|leave|list (or /eb party ...)
 permissions:
   eldritch.admin:
     default: op
-    description: Create, edit and save arenas and kits.
+    description: Create, edit, recover and save arenas and kits.

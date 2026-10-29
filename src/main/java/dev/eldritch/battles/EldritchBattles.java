@@ -7,6 +7,18 @@ import org.bukkit.block.BlockState;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
+import org.bukkit.attribute.Attribute;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityRegainHealthEvent;
+import org.bukkit.event.entity.EntityResurrectEvent;
+import org.bukkit.inventory.meta.Damageable;
+import org.bukkit.scoreboard.*;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.event.ClickEvent;
+import net.kyori.adventure.text.event.HoverEvent;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Item;
@@ -41,13 +53,16 @@ import java.util.zip.GZIPOutputStream;
 
 /** First public test build. No dependence on EpicDuels or Custom Teams. */
 @SuppressWarnings("deprecation")
-public final class EldritchBattles extends JavaPlugin implements Listener {
+public final class EldritchBattles extends JavaPlugin implements Listener, TabCompleter {
     private final Map<UUID, Party> membership = new HashMap<>();
     private final Map<UUID, Match> playing = new HashMap<>();
     private final Map<String, Arena> arenas = new LinkedHashMap<>();
     private final Map<String, Kit> kits = new LinkedHashMap<>();
     private final Map<String, Material> kitIcons = new HashMap<>();
     private final Map<UUID, UUID> invitations = new HashMap<>();
+    private final Map<UUID, Party> duelRequests = new HashMap<>();
+    private final Map<UUID, UUID> duelTargets = new HashMap<>();
+    private final LinkedHashMap<String, MatchReport> reports = new LinkedHashMap<>();
     private File arenaFile, kitsFile, recoveryFile;
     private YamlConfiguration arenaYaml, kitsYaml, recoveryYaml;
     private final String prefix = ChatColor.GOLD + "[Eldritch] " + ChatColor.RESET;
@@ -56,7 +71,9 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         final UUID owner;
         final LinkedHashMap<UUID, Integer> teams = new LinkedHashMap<>();
         boolean ffa = false, friendlyFire = false, drops = false, border = true;
-        int bestOf = 3;
+        boolean healthIndicator = true, shieldStuns = true, allowBreaking = false, infiniteRounds = false;
+        boolean directDuel = false;
+        int bestOf = 3; // Count of rounds, NOT best-of series. Saved field name retained for compatibility.
         String kit, arena;
         Match match;
         Party(UUID owner) { this.owner = owner; teams.put(owner, 1); }
@@ -77,7 +94,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         boolean busy;
         Arena(String id, String worldName) { this.id=id; this.worldName=worldName; }
         World world() { return Bukkit.getWorld(worldName); }
-        boolean ready() { return first != null && second != null && spawns.size() >= 2 && baseline != null; }
+        boolean ready() { return first != null && second != null && spawns.size() >= 2
+            && spawns.get(0) != null && spawns.get(1) != null && baseline != null && world() != null; }
         int minX(){return Math.min(first.getBlockX(), second.getBlockX());}
         int maxX(){return Math.max(first.getBlockX(), second.getBlockX());}
         int minY(){return Math.min(first.getBlockY(), second.getBlockY());}
@@ -101,10 +119,11 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         final GameMode gamemode;
         final Kit inventory;
         final int food;
+        final Scoreboard scoreboard;
         PlayerBackup(Player p){
             uuid=p.getUniqueId(); location=p.getLocation().clone(); gamemode=p.getGameMode();
             inventory=new Kit(p.getInventory().getStorageContents(),p.getInventory().getArmorContents(),p.getInventory().getItemInOffHand());
-            food=p.getFoodLevel();
+            food=p.getFoodLevel(); scoreboard=p.getScoreboard();
         }
     }
     static class Match {
@@ -112,10 +131,28 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         final Set<UUID> eliminated = new HashSet<>();
         final Map<String,Integer> wins=new HashMap<>();
         final Map<UUID,PlayerBackup> backups=new HashMap<>();
+        final Map<UUID,Kit> lastInventories=new HashMap<>();
+        final Map<UUID,Integer> deaths=new HashMap<>(), kills=new HashMap<>();
         final List<BukkitTask> tasks = new ArrayList<>();
+        Scoreboard healthBoard;
         int round=0; boolean ending=false, transitioning=true;
         Match(Party p,Arena a,Kit k){party=p;arena=a;kit=k;}
         String side(UUID u) {return party.ffa ? u.toString() : "team" + party.teams.getOrDefault(u,0);}
+    }
+    static class MatchReport {
+        final String id = UUID.randomUUID().toString().substring(0,8);
+        final String kitName, arenaName, winner, score;
+        final Map<UUID, Kit> inventories = new LinkedHashMap<>();
+        final Map<UUID, Integer> kills = new LinkedHashMap<>(), deaths = new LinkedHashMap<>();
+        MatchReport(Match m,String winnerName){
+            this.kitName=m.party.kit; this.arenaName=m.arena.id; this.winner=winnerName;
+            this.score=m.wins.toString();
+            for(UUID u:m.party.teams.keySet()){
+                Kit snapshot=m.lastInventories.get(u);
+                if(snapshot!=null)inventories.put(u,snapshot);
+                kills.put(u,m.kills.getOrDefault(u,0)); deaths.put(u,m.deaths.getOrDefault(u,0));
+            }
+        }
     }
     static class Menu implements InventoryHolder {
         final String page;
@@ -140,8 +177,10 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         kitsYaml=YamlConfiguration.loadConfiguration(kitsFile);
         recoveryYaml=YamlConfiguration.loadConfiguration(recoveryFile);
         loadKits(); loadArenas();
+        // Restore a sane border after an interrupted match/restart in a plugin-owned arena world.
+        for(Arena arena:arenas.values())if(arena.world()!=null)arena.world().getWorldBorder().reset();
         getServer().getPluginManager().registerEvents(this,this);
-        getLogger().info("Eldritch Battles v0.1.2 enabled. Use /eb help");
+        getLogger().info("Eldritch Battles v0.2.0 enabled. Use /eb help");
     }
     @Override public void onDisable(){
         for(Match match: new HashSet<>(playing.values())){
@@ -160,33 +199,148 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
     }}
     private boolean admin(Player p){if(p.hasPermission("eldritch.admin"))return true;msg(p,"&cYou need OP/admin permission.");return false;}
     private void help(Player p){
-        msg(p,"&e/eb party create | invite <player> | join <host> | leave | list | menu");
-        msg(p,"&e/eb kit save <name> | list | delete <name> &7(admin)");
-        msg(p,"&eHold an item and use /eb kit icon <name> &7(admin)");
-        msg(p,"&e/eb arena create <name> | edit <name> | pos1 <name> | pos2 <name>");
-        msg(p,"&e/eb arena spawn <name> <1|2> &7(Team 1 / Team 2; FFA is random)");
-        msg(p,"&e/eb arena save <name> | list &7(admin)");
-        msg(p,"&e/eb menu &7(open your team/kit/settings UI)");
+        msg(p,"&6/duel <player> &7(1v1 challenge; /duel accept <player>)");
+        msg(p,"&6/party create | invite <player> | join <owner> | leave | list");
+        msg(p,"&e/eb menu &7(party home / team battles)");
+        msg(p,"&e/eb stop &7(end your infinite-round match)");
+        msg(p,"&e/eb kit save|icon|list|delete <name> &7(admin)");
+        msg(p,"&e/eb arena create|edit|pos1|pos2|spawn|save|list|inspect|recover &7(admin)");
     }
     @Override public boolean onCommand(CommandSender sender,Command command,String label,String[] args){
         if(!(sender instanceof Player p)){msg(sender,"Players must use this command in game.");return true;}
-        if(args.length==0 || args[0].equalsIgnoreCase("help")){help(p);return true;}
         try {
+            if(command.getName().equalsIgnoreCase("duel")){duelCommand(p,args);return true;}
+            if(command.getName().equalsIgnoreCase("party")){partyCommand(p,args);return true;}
+            if(args.length==0 || args[0].equalsIgnoreCase("help")){help(p);return true;}
             switch(args[0].toLowerCase(Locale.ROOT)) {
-                case "menu" -> openMenu(p,"teams");
+                case "menu" -> openMenu(p,"home");
+                case "duel" -> duelCommand(p,Arrays.copyOfRange(args,1,args.length));
                 case "party" -> partyCommand(p,Arrays.copyOfRange(args,1,args.length));
                 case "kit" -> kitCommand(p,Arrays.copyOfRange(args,1,args.length));
                 case "arena" -> arenaCommand(p,Arrays.copyOfRange(args,1,args.length));
+                case "stop" -> stopMatch(p);
+                case "report" -> reportCommand(p,Arrays.copyOfRange(args,1,args.length));
                 default -> help(p);
             }
         } catch(Exception ex){
             msg(p,"&cCommand failed: "+ex.getMessage());
             getLogger().warning("Command error for "+p.getName()+": "+ex);
+            ex.printStackTrace();
         }
         return true;
     }
+    @Override public List<String> onTabComplete(CommandSender sender,Command cmd,String alias,String[] a){
+        List<String> values=new ArrayList<>();
+        String root=cmd.getName().toLowerCase(Locale.ROOT);
+        if(root.equals("duel")){
+            if(a.length==1){values.addAll(List.of("accept","deny","cancel"));for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());}
+            else if(a.length==2 && (a[0].equalsIgnoreCase("accept")||a[0].equalsIgnoreCase("deny")))
+                for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());
+        }else if(root.equals("party")){
+            if(a.length==1)values.addAll(List.of("create","invite","join","leave","disband","list","menu"));
+            if(a.length==2&&(a[0].equalsIgnoreCase("invite")||a[0].equalsIgnoreCase("join")))
+                for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());
+        }else if(a.length==1)values.addAll(List.of("menu","duel","party","kit","arena","stop","report","help"));
+        else if(a.length==2){
+            switch(a[0].toLowerCase(Locale.ROOT)){
+                case "duel" -> {values.addAll(List.of("accept","deny","cancel"));for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());}
+                case "party" -> values.addAll(List.of("create","invite","join","leave","disband","list","menu"));
+                case "kit" -> values.addAll(List.of("save","list","delete","icon"));
+                case "arena" -> values.addAll(List.of("create","edit","pos1","pos2","spawn","save","list","inspect","recover"));
+            }
+        }else if(a.length==3){
+            if(a[0].equalsIgnoreCase("kit"))values.addAll(kits.keySet());
+            if(a[0].equalsIgnoreCase("arena"))values.addAll(arenas.keySet());
+            if(a[0].equalsIgnoreCase("party")&&(a[1].equalsIgnoreCase("invite")||a[1].equalsIgnoreCase("join")))
+                for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());
+        }else if(a.length==4 && a[0].equalsIgnoreCase("arena") && a[1].equalsIgnoreCase("spawn"))
+            values.addAll(List.of("1","2"));
+        String prefix=a[a.length-1].toLowerCase(Locale.ROOT);
+        return values.stream().filter(v->v.toLowerCase(Locale.ROOT).startsWith(prefix)).distinct().sorted().toList();
+    }
+    private void duelCommand(Player p,String[] args){
+        if(args.length==0){msg(p,"&e/duel <player> | accept <player> | deny <player> | cancel");return;}
+        String sub=args[0].toLowerCase(Locale.ROOT);
+        if(sub.equals("accept")||sub.equals("deny")){
+            Party challenge=duelRequests.get(p.getUniqueId());
+            if(challenge==null){msg(p,"&cNo pending duel challenge.");return;}
+            Player host=Bukkit.getPlayer(challenge.owner);
+            if(args.length>1 && (host==null||!host.getName().equalsIgnoreCase(args[1]))){msg(p,"&cNo duel challenge from that player.");return;}
+            if(sub.equals("deny")){cancelDuel(challenge,"&cDuel request declined.");return;}
+            if(membership.containsKey(p.getUniqueId()) || playing.containsKey(p.getUniqueId())){
+                msg(p,"&cLeave your party/finish your current match before accepting.");return;
+            }
+            duelRequests.remove(p.getUniqueId());duelTargets.remove(challenge.owner);
+            challenge.teams.put(p.getUniqueId(),2);membership.put(p.getUniqueId(),challenge);
+            msg(p,"&aChallenge accepted!");
+            if(host==null){cancelDuel(challenge,"&cChallenger left the server.");return;}
+            startMatch(host,challenge);return;
+        }
+        if(sub.equals("cancel")){
+            Party party=membership.get(p.getUniqueId());
+            if(party!=null && party.directDuel && party.match==null && party.owner.equals(p.getUniqueId()))
+                cancelDuel(party,"&eDuel cancelled.");
+            else msg(p,"&cNo pending duel to cancel.");
+            return;
+        }
+        Player target=Bukkit.getPlayerExact(args[0]);
+        if(target==null || target.equals(p)){msg(p,"&cChoose another online player.");return;}
+        if(membership.containsKey(p.getUniqueId()) || playing.containsKey(p.getUniqueId())){
+            msg(p,"&cLeave your current party or finish your match before a direct duel.");return;
+        }
+        if(membership.containsKey(target.getUniqueId()) || playing.containsKey(target.getUniqueId())){
+            msg(p,"&cThat player is already in a party or match.");return;
+        }
+        Party challenge=new Party(p.getUniqueId());challenge.directDuel=true;
+        challenge.arena=null; // random available arena unless explicitly selected
+        membership.put(p.getUniqueId(),challenge);
+        duelTargets.put(p.getUniqueId(),target.getUniqueId());
+        msg(p,"&aSelect a kit, choose random/specific arena, then START MATCH to send the challenge.");
+        openMenu(p,"kits");
+    }
+    private void sendDuelChallenge(Player host,Party party){
+        UUID targetUuid=duelTargets.get(host.getUniqueId());
+        Player target=targetUuid==null?null:Bukkit.getPlayer(targetUuid);
+        if(target==null || membership.containsKey(targetUuid) || playing.containsKey(targetUuid)){
+            msg(host,"&cTarget is unavailable. /duel cancel to exit.");return;
+        }
+        if(party.kit==null || !kits.containsKey(party.kit)){msg(host,"&cChoose a kit first.");return;}
+        Arena arena=resolveArena(party);
+        if(arena==null){msg(host,"&cNo ready, free arena. Check /eb arena inspect test.");return;}
+        if(duelRequests.containsKey(targetUuid)){msg(host,"&cThat player already has a pending challenge.");return;}
+        duelRequests.put(targetUuid,party);
+        msg(host,"&eChallenge sent to &f"+target.getName()+"&e. Awaiting acceptance.");
+        msg(target,"&6"+host.getName()+" challenged you! &eKit: "+party.kit+" &7Arena: "+arena.id);
+        openDuelRequest(target,party);
+        Bukkit.getScheduler().runTaskLater(this,()->{
+            if(duelRequests.get(targetUuid)==party)cancelDuel(party,"&cDuel request expired after 60 seconds.");
+        },1200L);
+    }
+    private void cancelDuel(Party party,String reason){
+        UUID target=duelTargets.remove(party.owner);
+        if(target!=null)duelRequests.remove(target,party);
+        if(party.match!=null)return;
+        for(UUID member:new ArrayList<>(party.teams.keySet()))membership.remove(member,party);
+        partyMsg(party,reason);
+        Player p=target==null?null:Bukkit.getPlayer(target);
+        if(p!=null)msg(p,reason);
+    }
+    private void openDuelRequest(Player target,Party party){
+        Menu m=new Menu("duelRequest",party);
+        m.inventory=Bukkit.createInventory(m,27,"Eldritch - Duel Challenge");
+        m.inventory.setItem(13,button(Material.NETHERITE_SWORD,"&6Duel vs "+Bukkit.getOfflinePlayer(party.owner).getName(),
+            "&eKit: "+party.kit,"&eArena: "+(party.arena==null?"Random":party.arena)));
+        action(m,11,"acceptDuel",button(Material.LIME_CONCRETE,"&aACCEPT"));
+        action(m,15,"denyDuel",button(Material.BARRIER,"&cDECLINE"));
+        target.openInventory(m.inventory);
+    }
+    private void stopMatch(Player player){
+        Match m=playing.get(player.getUniqueId());
+        if(m==null || !m.party.owner.equals(player.getUniqueId())){msg(player,"&cOnly the host can stop an ongoing match.");return;}
+        finishMatch(m,winningSide(m));
+    }
     private void partyCommand(Player p,String[] args){
-        if(args.length==0){openMenu(p,"teams");return;}
+        if(args.length==0){openMenu(p,"home");return;}
         Party party=membership.get(p.getUniqueId());
         switch(args[0].toLowerCase(Locale.ROOT)){
             case "create" -> {
@@ -212,7 +366,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
                 joined.teams.put(p.getUniqueId(),2);membership.put(p.getUniqueId(),joined);
                 invitations.remove(p.getUniqueId());partyMsg(joined,"&a"+p.getName()+" joined the party!");
             }
-            case "leave" -> {
+            case "leave", "disband" -> {
                 if(party==null){msg(p,"&cNot in a party.");return;}
                 if(party.match!=null){msg(p,"&cCan't leave during an active match.");return;}
                 if(party.owner.equals(p.getUniqueId())){
@@ -228,7 +382,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
                     msg(p,"&7- "+op.getName()+" : "+(party.ffa?"FFA": "Team "+e.getValue()));
                 }
             }
-            case "menu" -> openMenu(p,"teams");
+            case "menu" -> openMenu(p,"home");
             default -> msg(p,"&c/eb party create|invite|join|leave|list|menu");
         }
     }
@@ -305,6 +459,27 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         Arena ar=arenas.get(id);if(ar==null){msg(p,"&cUnknown arena. /eb arena list");return;}
         if(ar.busy){msg(p,"&cWait until the arena fight/reset is finished.");return;}
         switch(a[0].toLowerCase(Locale.ROOT)){
+            case "inspect" -> {
+                msg(p,"&6Arena "+ar.id+": world="+ar.worldName+", loaded="+(ar.world()!=null));
+                msg(p,"&7pos1="+(ar.first==null?"MISSING":ar.first.toVector())+" pos2="+(ar.second==null?"MISSING":ar.second.toVector()));
+                msg(p,"&7spawns="+ar.spawns.size()+" snapshot="+(ar.baseline==null?"MISSING":"YES, "+ar.baseline.size()+" blocks"));
+                msg(p,"&eIf snapshot exists but corners are missing, try /eb arena recover "+ar.id);
+            }
+            case "recover" -> {
+                if(ar.ready()){msg(p,"&aArena already ready; no recovery needed.");return;}
+                List<BlockRecord> records=loadSnapshot(ar);
+                if(records==null||records.isEmpty()){msg(p,"&cNo snapshot found. Set corners and /eb arena save "+id);return;}
+                int minX=Integer.MAX_VALUE,minY=Integer.MAX_VALUE,minZ=Integer.MAX_VALUE,maxX=Integer.MIN_VALUE,maxY=Integer.MIN_VALUE,maxZ=Integer.MIN_VALUE;
+                for(BlockRecord b:records){minX=Math.min(minX,b.x);maxX=Math.max(maxX,b.x);
+                    minY=Math.min(minY,b.y);maxY=Math.max(maxY,b.y);minZ=Math.min(minZ,b.z);maxZ=Math.max(maxZ,b.z);}
+                Location first=new Location(ar.world(),minX,minY,minZ),second=new Location(ar.world(),maxX,maxY,maxZ);
+                long volume=(long)(maxX-minX+1)*(maxY-minY+1)*(maxZ-minZ+1);
+                if(volume>getConfig().getLong("max-snapshot-blocks",250000)){
+                    msg(p,"&cSaved block bounds too large to infer safely. Set corners manually; DO NOT overwrite a backup.");return;
+                }
+                ar.first=first;ar.second=second;ar.baseline=records;saveArenas();
+                msg(p,"&aRecovered arena corners from snapshot, volume="+volume+". No blocks were changed.");
+            }
             case "edit" -> {World w=ar.world();if(w!=null)p.teleport(ar.spawns.isEmpty()?new Location(w,0.5,80,0.5):ar.spawns.get(0));}
             case "pos1" -> {if(!inArenaWorld(p,ar))return;ar.first=p.getLocation().clone();ar.baseline=null;saveArenas();msg(p,"&aCorner 1 set.");}
             case "pos2" -> {if(!inArenaWorld(p,ar))return;ar.second=p.getLocation().clone();ar.baseline=null;saveArenas();msg(p,"&aCorner 2 set.");}
@@ -474,61 +649,110 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
     }
     private void openMenu(Player player,String page){
         Party party=membership.get(player.getUniqueId());
-        if(party==null){msg(player,"&cCreate a party with /eb party create first.");return;}
+        if(party==null){
+            if(page.equals("home")){
+                party=new Party(player.getUniqueId());membership.put(player.getUniqueId(),party);
+                msg(player,"&aParty created. Use /party invite <player>.");
+            }else {msg(player,"&cCreate a party with /party create first.");return;}
+        }
         if(party.match!=null){msg(player,"&cYou are currently fighting.");return;}
         Menu menu=new Menu(page,party);
-        String title=switch(page){case "teams"->"ELDRITCH - Team Battle";case "kits"->"ELDRITCH - Select Kit";
-            case "arenas"->"ELDRITCH - Arena";default->"ELDRITCH - Match Settings";};
+        String title=switch(page){
+            case "home" -> "Eldritch - Party Menu";
+            case "teams" -> "Eldritch - Team Battle";
+            case "kits" -> "Eldritch - Select Kit";
+            case "arenas" -> "Eldritch - Choose Arena";
+            case "rounds" -> "Eldritch - Number of Rounds";
+            case "duelSettings" -> "Eldritch - Duel Settings";
+            default -> "Eldritch - Match Settings";
+        };
         menu.inventory=Bukkit.createInventory(menu,54,title);
         for(int i=0;i<54;i++)menu.inventory.setItem(i,button(Material.GRAY_STAINED_GLASS_PANE," "));
-        if(page.equals("teams")){
-            for(int s=9;s<27;s++)menu.inventory.setItem(s,button(Material.RED_STAINED_GLASS_PANE,"&cTeam 1"));
-            for(int s=27;s<45;s++)menu.inventory.setItem(s,button(Material.BLUE_STAINED_GLASS_PANE,"&9Team 2"));
-            int red=9,blue=27,ffaSlot=9;
+        if(page.equals("home")){
+            OfflinePlayer owner=Bukkit.getOfflinePlayer(party.owner);
+            ItemStack head=new ItemStack(Material.PLAYER_HEAD);
+            SkullMeta meta=(SkullMeta)head.getItemMeta();meta.setOwningPlayer(owner);
+            meta.setDisplayName(ChatColor.GOLD+"Owner: "+owner.getName());
+            meta.setLore(List.of(ChatColor.GRAY+"Members: "+party.teams.size(),ChatColor.YELLOW+"/party invite <name>"));
+            head.setItemMeta(meta);menu.inventory.setItem(4,head);
+            action(menu,22,"teams",button(Material.NETHERITE_SWORD,"&6Party Team Battle","&7Teams → Kit → Match Settings"));
+            action(menu,31,"leave",button(Material.BARRIER,"&cDisband Party","&7Leader disbands; members leave"));
+            if(party.directDuel)action(menu,24,"kits",button(Material.DIAMOND_SWORD,"&eDirect Duel","&7Select a kit"));
+        }else if(page.equals("teams")){
+            for(int i=9;i<27;i++)menu.inventory.setItem(i,button(Material.RED_STAINED_GLASS_PANE,"&cTeam 1"));
+            for(int i=27;i<45;i++)menu.inventory.setItem(i,button(Material.BLUE_STAINED_GLASS_PANE,"&9Team 2"));
+            int red=9,blue=27,free=9;
             for(Map.Entry<UUID,Integer> e:party.teams.entrySet()){
-                if(red>=27||blue>=45||ffaSlot>=45)break;
+                if(red>=27||blue>=45||free>=45)break;
                 OfflinePlayer op=Bukkit.getOfflinePlayer(e.getKey());
-                ItemStack head=new ItemStack(Material.PLAYER_HEAD);SkullMeta m=(SkullMeta)head.getItemMeta();
-                m.setOwningPlayer(op);m.setDisplayName(ChatColor.YELLOW+(op.getName()==null?e.getKey().toString():op.getName()));
-                m.setLore(List.of(ChatColor.GRAY+(party.ffa?"FFA — everyone for themselves":"Team "+e.getValue()),
-                    ChatColor.GREEN+"Click to swap team"));head.setItemMeta(m);
-                int slot=party.ffa?ffaSlot++:(e.getValue()==1?red++:blue++);
-                action(menu,slot,"swap:"+e.getKey(),head);
+                ItemStack head=new ItemStack(Material.PLAYER_HEAD);SkullMeta meta=(SkullMeta)head.getItemMeta();
+                meta.setOwningPlayer(op);meta.setDisplayName(ChatColor.YELLOW+(op.getName()==null?e.getKey().toString():op.getName()));
+                meta.setLore(List.of(ChatColor.GRAY+(party.ffa?"Free for all":"Team "+e.getValue()),ChatColor.GREEN+"Click to swap teams"));head.setItemMeta(meta);
+                action(menu,party.ffa?free++:(e.getValue()==1?red++:blue++),"swap:"+e.getKey(),head);
             }
-            action(menu,45,"leave",button(Material.BARRIER,"&cLeave party"));
-            action(menu,49,"ffa",button(Material.NETHER_STAR,party.ffa?"&aFFA MODE ON":"&eTeam battle", "&7Click to toggle FFA/teams"));
-            action(menu,53,"next",button(Material.LIME_STAINED_GLASS_PANE,"&aConfirm teams / Next"));
+            action(menu,45,"home",button(Material.BARRIER,"&cBack to party"));
+            action(menu,49,"ffa",button(Material.NETHER_STAR,party.ffa?"&aFFA enabled":"&eTeam Battle","&7Click to toggle FFA/teams"));
+            action(menu,53,"kits",button(Material.LIME_CONCRETE,"&aChoose Kit"));
         }else if(page.equals("kits")){
             int i=0;
             for(String id:kits.keySet()){
                 if(i>=45)break;
-                Material defaultIcon= id.contains("pot")?Material.SPLASH_POTION:id.contains("mace")?Material.MACE:
+                Material def=id.contains("pot")?Material.SPLASH_POTION:id.contains("mace")?Material.MACE:
                     id.contains("crystal")?Material.END_CRYSTAL:id.contains("uhc")?Material.GOLDEN_APPLE:Material.DIAMOND_SWORD;
-                Material icon=kitIcons.getOrDefault(id,defaultIcon);
-                action(menu,i++,"kit:"+id,button(icon,"&6"+id, "&7Click to choose kit"));
+                action(menu,i++,"kit:"+id,button(kitIcons.getOrDefault(id,def),"&6"+id,
+                    "&7Click to choose and open settings"));
             }
-            action(menu,45,"back",button(Material.RED_STAINED_GLASS_PANE,"&cBack"));
-            action(menu,53,"next",button(Material.LIME_STAINED_GLASS_PANE,"&aSettings", "&7Selected kit: "+(party.kit==null?"NONE":party.kit)));
+            action(menu,45,"back",button(Material.BARRIER,"&cBack"));
         }else if(page.equals("arenas")){
-            int i=0;
+            action(menu,0,"arena:auto",button(Material.ENDER_EYE,"&eRandom Available Arena",
+                "&7Automatically selects a ready, unused arena"));
+            int i=1;
             for(Arena a:arenas.values()){
                 if(i>=45)break;
-                if(!a.ready())continue;
-                action(menu,i++,"arena:"+a.id,button(Material.GRASS_BLOCK,"&e"+a.id, "&7Click to select",a.busy?"&cBusy":"&aAvailable"));
+                action(menu,i++,"arena:"+a.id,button(Material.GRASS_BLOCK,"&e"+a.id,
+                    "&7"+(a.ready()?"Ready":"Not ready: /eb arena inspect "+a.id),a.busy?"&cBusy":"&aSelect arena"));
             }
-            action(menu,45,"back",button(Material.RED_STAINED_GLASS_PANE,"&cBack"));
-            action(menu,53,"settings",button(Material.LIME_STAINED_GLASS_PANE,"&aReturn to settings"));
-        }else{
-            action(menu,10,"rounds",button(Material.CLOCK,"&eBest of "+party.bestOf,"&7Click: 1 → 3 → 5 → 7"));
-            action(menu,12,"arenaMenu",button(Material.GRASS_BLOCK,"&eArena: "+(party.arena==null?"None":party.arena),"&7Click to select arena"));
-            action(menu,14,"friendly",button(Material.IRON_SWORD,"&eFriendly fire: "+(party.friendlyFire?"ON":"OFF")));
-            action(menu,16,"drops",button(Material.HOPPER,"&eItem drops: "+(party.drops?"ON":"OFF")));
-            action(menu,31,"border",button(Material.BEACON,"&e8-minute shrinking border: "+(party.border?"ON":"OFF")));
-            action(menu,45,"back",button(Material.RED_STAINED_GLASS_PANE,"&cBack"));
-            action(menu,53,"start",button(Material.LIME_STAINED_GLASS_PANE,"&aSTART MATCH", "&7Kit: "+party.kit,"&7Arena: "+party.arena));
+            action(menu,45,"settings",button(Material.BARRIER,"&cBack to Settings"));
+        }else if(page.equals("settings")){
+            action(menu,10,"rounds",button(Material.CLOCK,
+                "&eRounds: "+(party.infiniteRounds?"INFINITE":party.bestOf),
+                "&7Left click: choose number of rounds","&7Shift click: infinite rounds"));
+            action(menu,13,"arenaMenu",button(Material.GRASS_BLOCK,"&eArena: "+(party.arena==null?"RANDOM":party.arena),
+                "&7Choose random or select an arena"));
+            action(menu,16,"duelSettings",button(Material.CHAIN,"&6Duel Settings",
+                "&7Health, shield stuns, blocks, friendly fire","&7Drops and shrinking border"));
+            action(menu,45,"kits",button(Material.BARRIER,"&cBack to Kits"));
+            action(menu,53,"start",button(Material.LIME_CONCRETE,"&aSTART MATCH",
+                party.directDuel?"&7Send duel request to opponent":"&7Teleport everyone into arena",
+                "&7Kit: "+(party.kit==null?"none":party.kit)));
+        }else if(page.equals("rounds")){
+            action(menu,10,"r:-5",button(Material.RED_CONCRETE,"&c-5 Rounds"));
+            action(menu,11,"r:-1",button(Material.RED_STAINED_GLASS_PANE,"&c-1 Round"));
+            action(menu,13,"r:inf",button(Material.NETHER_STAR,
+                party.infiniteRounds?"&aINFINITE ROUNDS":"&eRounds: "+party.bestOf,
+                "&7Click to toggle infinite rounds","&7Press /eb stop to end infinite mode"));
+            action(menu,15,"r:1",button(Material.LIME_STAINED_GLASS_PANE,"&a+1 Round"));
+            action(menu,16,"r:5",button(Material.LIME_CONCRETE,"&a+5 Rounds"));
+            int[] presets={1,3,5,7,10,15,20};
+            for(int i=0;i<presets.length;i++)action(menu,28+i,"r:set:"+presets[i],
+                button(Material.CLOCK,"&e"+presets[i]+" Round"+(presets[i]==1?"":"s")));
+            action(menu,45,"settings",button(Material.BARRIER,"&cBack to Settings"));
+        }else if(page.equals("duelSettings")){
+            action(menu,10,"health",button(Material.GOLDEN_APPLE,"&6Health Indicator: "+onOff(party.healthIndicator),
+                "&7Show health below player names"));
+            action(menu,11,"shield",button(Material.SHIELD,"&eShield Stuns: "+onOff(party.shieldStuns),
+                "&7Axes disable blocking shields"));
+            action(menu,12,"breaking",button(Material.IRON_PICKAXE,"&eBlock Breaking: "+onOff(party.allowBreaking),
+                "&7If OFF, players can place but cannot break"));
+            action(menu,13,"friendly",button(Material.DIAMOND_SWORD,"&eFriendly Fire: "+onOff(party.friendlyFire)));
+            action(menu,14,"drops",button(Material.HOPPER,"&eDeath Drops: "+onOff(party.drops)));
+            action(menu,15,"border",button(Material.TNT,"&eShrinking Border: "+onOff(party.border),
+                "&7Border stays centered on the fighting arena"));
+            action(menu,45,"settings",button(Material.BARRIER,"&cBack to Match Settings"));
         }
         player.openInventory(menu.inventory);
     }
+    private String onOff(boolean value){return value?"&aON":"&cOFF";}
     @EventHandler public void inventoryClick(InventoryClickEvent event){
         if(!(event.getWhoClicked() instanceof Player p))return;
         Inventory top=event.getView().getTopInventory();
@@ -536,38 +760,71 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         event.setCancelled(true);
         if(event.getClickedInventory()!=top)return;
         String action=menu.actions.get(event.getRawSlot());if(action==null)return;
+        if(menu.page.equals("report")){
+            if(action.equals("close"))p.closeInventory();return;
+        }
+        if(menu.page.equals("duelRequest")){
+            if(duelRequests.get(p.getUniqueId())!=menu.party){p.closeInventory();msg(p,"&cChallenge expired.");return;}
+            p.closeInventory();duelCommand(p,new String[]{action.equals("acceptDuel")?"accept":"deny"});return;
+        }
         Party party=membership.get(p.getUniqueId());
         if(party==null||party!=menu.party){p.closeInventory();return;}
         if(!isLeader(p,party)){msg(p,"&cOnly the party leader can configure this menu.");return;}
-        String destination=menu.page;
+        String next=menu.page;
         if(action.startsWith("swap:")){
             if(!party.ffa){UUID uuid=UUID.fromString(action.substring(5));
                 party.teams.put(uuid,party.teams.getOrDefault(uuid,2)==1?2:1);}
-            destination="teams";
-        }else if(action.equals("ffa")){party.ffa=!party.ffa;destination="teams";}
-        else if(action.startsWith("kit:")){party.kit=action.substring(4);destination="kits";}
-        else if(action.startsWith("arena:")){party.arena=action.substring(6);destination="settings";}
-        else switch(action){
-            case "next" -> {
-                if(menu.page.equals("teams"))destination="kits";
-                else if(menu.page.equals("kits"))destination="settings";
+            next="teams";
+        }else if(action.equals("ffa")){party.ffa=!party.ffa;next="teams";}
+        else if(action.startsWith("kit:")){party.kit=action.substring(4);next="settings";}
+        else if(action.startsWith("arena:")){
+            String id=action.substring(6);
+            if(!id.equals("auto") && !arenas.containsKey(id))return;
+            party.arena=id.equals("auto")?null:id;next="settings";
+        }else if(action.startsWith("r:")){
+            if(action.equals("r:inf"))party.infiniteRounds=!party.infiniteRounds;
+            else if(action.startsWith("r:set:")){
+                party.bestOf=Integer.parseInt(action.substring(6));party.infiniteRounds=false;
+            }else{
+                party.bestOf=Math.max(1,Math.min(99,party.bestOf+Integer.parseInt(action.substring(2))));
+                party.infiniteRounds=false;
             }
-            case "back" -> destination=menu.page.equals("kits")?"teams":menu.page.equals("arenas")?"settings":"kits";
-            case "settings" -> destination="settings";
-            case "arenaMenu" -> destination="arenas";
-            case "rounds" -> party.bestOf=party.bestOf==1?3:party.bestOf==3?5:party.bestOf==5?7:1;
+            next="rounds";
+        }else switch(action){
+            case "home","teams","kits","settings","duelSettings","arenaMenu" ->
+                next=action.equals("arenaMenu")?"arenas":action;
+            case "back" -> next=party.directDuel?"settings":"teams";
+            case "rounds" -> {
+                if(event.isShiftClick()){party.infiniteRounds=!party.infiniteRounds;next="settings";}
+                else next="rounds";
+            }
+            case "health" -> party.healthIndicator=!party.healthIndicator;
+            case "shield" -> party.shieldStuns=!party.shieldStuns;
+            case "breaking" -> party.allowBreaking=!party.allowBreaking;
             case "friendly" -> party.friendlyFire=!party.friendlyFire;
             case "drops" -> party.drops=!party.drops;
             case "border" -> party.border=!party.border;
             case "leave" -> {p.closeInventory();partyCommand(p,new String[]{"leave"});return;}
-            case "start" -> {p.closeInventory();startMatch(p,party);return;}
-            default -> {}
+            case "start" -> {
+                p.closeInventory();
+                if(party.directDuel)sendDuelChallenge(p,party);else startMatch(p,party);
+                return;
+            }
         }
-        String next=destination;
-        Bukkit.getScheduler().runTask(this,()->openMenu(p,next));
+        String destination=next;
+        Bukkit.getScheduler().runTask(this,()->{if(p.isOnline())openMenu(p,destination);});
     }
     @EventHandler public void inventoryDrag(InventoryDragEvent event){
         if(event.getView().getTopInventory().getHolder() instanceof Menu)event.setCancelled(true);
+    }
+    private Arena resolveArena(Party party){
+        if(party.arena!=null){
+            Arena selected=arenas.get(party.arena);
+            return selected!=null && selected.ready() && !selected.busy?selected:null;
+        }
+        List<Arena> ready=new ArrayList<>();
+        for(Arena a:arenas.values())if(a.ready()&&!a.busy)ready.add(a);
+        return ready.isEmpty()?null:ready.get(ThreadLocalRandom.current().nextInt(ready.size()));
     }
     private void startMatch(Player owner,Party party){
         if(!isLeader(owner,party))return;
@@ -582,74 +839,126 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
             if(playing.containsKey(u)){msg(owner,"&cA player is already fighting.");return;}
         }
         if(party.kit==null||!kits.containsKey(party.kit)){msg(owner,"&cSelect a saved kit first.");return;}
-        Arena arena=arenas.get(party.arena);
-        if(arena==null||!arena.ready()){msg(owner,"&cChoose a saved arena first.");return;}
-        if(arena.busy){msg(owner,"&cArena already in use.");return;}
+        Arena arena=resolveArena(party);
+        if(arena==null){msg(owner,"&cNo available ready arena. Check /eb arena inspect <name>.");return;}
         if(arena.spawns.size()<2 || arena.spawns.get(0)==null || arena.spawns.get(1)==null){
-            msg(owner,"&cSet Team 1 and Team 2 spawn points with /eb arena spawn "+arena.id+" 1/2.");return;
+            msg(owner,"&cSet Team 1/2 spawns with /eb arena spawn "+arena.id+" 1 or 2.");return;
+        }
+        Map<UUID,Location> initial=new LinkedHashMap<>();
+        for(Map.Entry<UUID,Integer> entry:party.teams.entrySet()){
+            int team=party.ffa?1:entry.getValue();
+            Location anchor=arena.spawns.get(team==2?1:0);
+            if(anchor==null || !anchor.getWorld().equals(arena.world())){
+                msg(owner,"&cSaved spawn points are missing/incorrect. Use /eb arena spawn "+arena.id+" 1/2.");return;
+            }
+            initial.put(entry.getKey(),anchor.clone());
         }
         arena.busy=true;
         Match m=new Match(party,arena,kits.get(party.kit));party.match=m;
+        setupBorder(m); // Set CENTER before size and BEFORE anyone teleports; avoids previous border damage.
         for(UUID u:party.teams.keySet()){
-            Player p=Bukkit.getPlayer(u);m.backups.put(u,new PlayerBackup(p));
-            saveRecovery(m.backups.get(u));playing.put(u,m);
+            Player p=Bukkit.getPlayer(u);
+            PlayerBackup backup=new PlayerBackup(p);m.backups.put(u,backup);
+            saveRecovery(backup);playing.put(u,m);
             p.closeInventory();p.setGameMode(GameMode.ADVENTURE);
-            p.teleport(Bukkit.getWorlds().get(0).getSpawnLocation());
+            p.setInvulnerable(false);p.setFallDistance(0);p.setGravity(false);
+            p.teleport(initial.get(u)); // Immediate arena teleport while the baseline is being restored.
+            p.sendTitle(ChatColor.GOLD+"MATCH FOUND",ChatColor.YELLOW+party.kit+" • "+arena.id,10,45,10);
         }
-        partyMsg(party,"&6Match started: "+party.kit+" | "+(party.ffa?"FFA":red+"v"+blue)+" | BO"+party.bestOf);
+        partyMsg(party,"&6MATCH FOUND! &e"+party.kit+" | "+(party.ffa?"FFA":red+"v"+blue)
+            +" | "+(party.infiniteRounds?"Infinite rounds":party.bestOf+" rounds"));
         beginRound(m);
+    }
+    private void setupBorder(Match m){
+        WorldBorder border=m.arena.world().getWorldBorder();
+        border.reset();
+        double centerX=(m.arena.minX()+m.arena.maxX()+1)/2.0;
+        double centerZ=(m.arena.minZ()+m.arena.maxZ()+1)/2.0;
+        border.setCenter(centerX,centerZ);
+        double size=Math.max(100.0,Math.max(m.arena.maxX()-m.arena.minX()+1,
+            m.arena.maxZ()-m.arena.minZ()+1)+40.0);
+        border.setSize(size);
+        border.setDamageAmount(0.0); // No border damage during teleport/countdown.
+        border.setWarningDistance(6);
     }
     private void beginRound(Match m){
         if(m.ending)return;
         m.transitioning=true;
         for(BukkitTask task:m.tasks)task.cancel();m.tasks.clear();
-        m.arena.world().getWorldBorder().setSize(Math.max(100,
-            Math.max(m.arena.maxX()-m.arena.minX(),m.arena.maxZ()-m.arena.minZ())+20));
+        setupBorder(m);
+        partyMsg(m.party,"&ePreparing saved arena blocks...");
         resetArena(m.arena,()->{
             if(m.ending)return;
-            m.round++;m.eliminated.clear();
-            // Team battles use only two saved team anchors; FFA finds fresh safe floor spots every round.
+            m.round++;m.eliminated.clear();m.lastInventories.clear();
             Map<UUID,Location> positions=chooseRoundSpawns(m);
             if(positions==null){
-                partyMsg(m.party,"&cCannot find enough safe spawn locations on this arena's floor."
-                    +" &eMove Team 1/2 spawns to the fighting floor, then try again.");
+                partyMsg(m.party,"&cCannot find enough safe spawn locations inside the saved arena."
+                    +" &7Move team spawns onto the fighting floor and check /eb arena inspect.");
                 abortMatch(m);return;
             }
             for(UUID uuid:m.party.teams.keySet()){
-                Player p=Bukkit.getPlayer(uuid);if(p==null){m.eliminated.add(uuid);continue;}
+                Player p=Bukkit.getPlayer(uuid);
+                if(p==null){m.eliminated.add(uuid);continue;}
                 PlayerInventory inv=p.getInventory();inv.clear();
                 inv.setStorageContents(cloneItems(m.kit.storage));
                 inv.setArmorContents(cloneItems(m.kit.armor));
                 inv.setItemInOffHand(m.kit.offhand==null?new ItemStack(Material.AIR):m.kit.offhand.clone());
                 p.setGameMode(GameMode.SURVIVAL);p.setFoodLevel(20);p.setSaturation(20);
                 p.setFireTicks(0);p.setFallDistance(0);
-                p.setHealth(p.getAttribute(org.bukkit.attribute.Attribute.MAX_HEALTH)==null?20.0:
-                    p.getAttribute(org.bukkit.attribute.Attribute.MAX_HEALTH).getValue());
-                p.teleport(positions.get(uuid));
+                p.setHealth(p.getAttribute(Attribute.MAX_HEALTH)==null?20.0:
+                    p.getAttribute(Attribute.MAX_HEALTH).getValue());
+                p.teleport(positions.get(uuid));p.setGravity(true);
             }
-            partyMsg(m.party,"&eRound "+m.round+" of BO"+m.party.bestOf+" begins in 5 seconds!");
-            // Freeze by cancelling PvP damage while countdown is active.
-            BukkitTask countdown=Bukkit.getScheduler().runTaskLater(this,()->{
-                if(m.ending)return;
-                m.transitioning=false;
-                partyMsg(m.party,"&aFIGHT!");
-                if(m.party.border && getConfig().getBoolean("border.enabled",true)){
-                    WorldBorder b=m.arena.world().getWorldBorder();
-                    b.setCenter((m.arena.minX()+m.arena.maxX())/2.0,(m.arena.minZ()+m.arena.maxZ())/2.0);
-                    b.setSize(Math.max(m.arena.maxX()-m.arena.minX(),m.arena.maxZ()-m.arena.minZ())+20);
-                    int delay=getConfig().getInt("border.delay-seconds",480);
-                    BukkitTask borderTask=Bukkit.getScheduler().runTaskLater(this,()->{
-                        if(!m.ending&&!m.transitioning){
-                            b.setSize(getConfig().getDouble("border.final-size",10),
-                                getConfig().getLong("border.shrink-seconds",180));
-                            partyMsg(m.party,"&cWorld border is shrinking!");
+            applyHealthIndicator(m);
+            partyMsg(m.party,"&eRound "+m.round+" / "+(m.party.infiniteRounds?"∞":m.party.bestOf)+" begins soon!");
+            BukkitTask countdown=new BukkitRunnable(){
+                int seconds=5;
+                @Override public void run(){
+                    if(m.ending){cancel();return;}
+                    if(seconds<=0){
+                        cancel();m.transitioning=false;
+                        for(UUID u:m.party.teams.keySet()){
+                            Player p=Bukkit.getPlayer(u);
+                            if(p!=null)p.sendTitle(ChatColor.GREEN+"FIGHT!",ChatColor.YELLOW+"Round "+m.round,0,25,10);
                         }
-                    },20L*Math.max(1,delay));m.tasks.add(borderTask);
+                        if(m.party.border && getConfig().getBoolean("border.enabled",true)){
+                            WorldBorder b=m.arena.world().getWorldBorder();
+                            b.setDamageAmount(0.2);
+                            int delay=Math.max(1,getConfig().getInt("border.delay-seconds",480));
+                            BukkitTask borderTask=Bukkit.getScheduler().runTaskLater(EldritchBattles.this,()->{
+                                if(!m.ending&&!m.transitioning){
+                                    b.setSize(Math.max(1,getConfig().getDouble("border.final-size",10)),
+                                        Math.max(1,getConfig().getLong("border.shrink-seconds",180)));
+                                    partyMsg(m.party,"&cWorld border is shrinking!");
+                                }
+                            },20L*delay);m.tasks.add(borderTask);
+                        }
+                        checkRound(m);return;
+                    }
+                    for(UUID u:m.party.teams.keySet()){
+                        Player p=Bukkit.getPlayer(u);
+                        if(p!=null)p.sendTitle(ChatColor.GOLD+""+seconds,
+                            ChatColor.YELLOW+"Round "+m.round+" of "+(m.party.infiniteRounds?"∞":m.party.bestOf),0,22,0);
+                    }
+                    seconds--;
                 }
-            },100L);m.tasks.add(countdown);
-            // Mark a quit during preparation as a forfeit.
-            Bukkit.getScheduler().runTaskLater(this,()->checkRound(m),101L);
+            }.runTaskTimer(this,0L,20L);
+            m.tasks.add(countdown);
         });
+    }
+    private void applyHealthIndicator(Match match){
+        if(!match.party.healthIndicator)return;
+        ScoreboardManager sm=Bukkit.getScoreboardManager();
+        if(sm==null)return;
+        Scoreboard board=sm.getNewScoreboard();
+        try{
+            Objective health=board.registerNewObjective("eb_health",Criteria.HEALTH,Component.text("❤",NamedTextColor.RED));
+            health.setDisplaySlot(DisplaySlot.BELOW_NAME);
+            match.healthBoard=board;
+            for(UUID u:match.party.teams.keySet()){
+                Player p=Bukkit.getPlayer(u);if(p!=null)p.setScoreboard(board);
+            }
+        }catch(Exception ex){getLogger().warning("Could not display health indicator: "+ex.getMessage());}
     }
     /** Only choose level, solid, non-hazardous floor with space for the player and their head. */
     private boolean isSafeArenaSpawn(Arena a,Location at){
@@ -732,10 +1041,25 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         for(UUID u:m.party.teams.keySet()){
             playing.remove(u);
             Player p=Bukkit.getPlayer(u);PlayerBackup b=m.backups.get(u);
-            if(p!=null && b!=null && !p.isDead())restore(p,b);
+            if(p!=null && b!=null && !p.isDead()){p.setGravity(true);restore(p,b);}
         }
         m.party.match=null;m.arena.busy=false;
         m.arena.world().getWorldBorder().reset();
+        cleanupDuelParty(m.party);
+    }
+    @EventHandler public void onBreak(BlockBreakEvent event){
+        Match m=playing.get(event.getPlayer().getUniqueId());
+        if(m!=null && (m.ending || m.transitioning || !m.party.allowBreaking))event.setCancelled(true);
+    }
+    @EventHandler public void onPlace(BlockPlaceEvent event){
+        Match m=playing.get(event.getPlayer().getUniqueId());
+        if(m!=null && (m.ending || m.transitioning))event.setCancelled(true);
+    }
+    @EventHandler public void onAnyDamage(EntityDamageEvent event){
+        if(!(event.getEntity() instanceof Player p))return;
+        Match m=playing.get(p.getUniqueId());
+        if(m!=null && (m.ending || m.transitioning || m.eliminated.contains(p.getUniqueId())))
+            event.setCancelled(true);
     }
     @EventHandler public void damage(EntityDamageByEntityEvent event){
         if(!(event.getEntity() instanceof Player hurt))return;
@@ -745,11 +1069,28 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         Player attacker=source instanceof Player p?p:source instanceof Projectile projectile&&projectile.getShooter() instanceof Player p?p:null;
         if(attacker!=null&&m.party.teams.containsKey(attacker.getUniqueId())&& !m.party.ffa
             && m.side(attacker.getUniqueId()).equals(m.side(hurt.getUniqueId()))&&!m.party.friendlyFire){
-            event.setCancelled(true);
+            event.setCancelled(true);return;
+        }
+        if(attacker!=null && hurt.isBlocking()){
+            String weapon=attacker.getInventory().getItemInMainHand().getType().name();
+            if(weapon.endsWith("_AXE") && !weapon.equals("PICKAXE")){
+                // Applying or cancelling a cooldown adjusts shield stuns without changing kit equipment.
+                if(m.party.shieldStuns)hurt.setCooldown(Material.SHIELD,100);
+                else Bukkit.getScheduler().runTask(this,()->{
+                    if(playing.get(hurt.getUniqueId())==m)hurt.setCooldown(Material.SHIELD,0);
+                });
+            }
         }
     }
+    private Kit currentKit(Player p){return new Kit(p.getInventory().getStorageContents(),
+        p.getInventory().getArmorContents(),p.getInventory().getItemInOffHand());}
     @EventHandler public void onDeath(PlayerDeathEvent event){
         Player p=event.getEntity();Match m=playing.get(p.getUniqueId());if(m==null)return;
+        m.lastInventories.put(p.getUniqueId(),currentKit(p));
+        m.deaths.merge(p.getUniqueId(),1,Integer::sum);
+        Player killer=p.getKiller();
+        if(killer!=null && m.party.teams.containsKey(killer.getUniqueId()) &&
+            !killer.getUniqueId().equals(p.getUniqueId()))m.kills.merge(killer.getUniqueId(),1,Integer::sum);
         if(!m.party.drops){event.setKeepInventory(true);event.getDrops().clear();}
         event.setKeepLevel(true);event.setDroppedExp(0);
         m.eliminated.add(p.getUniqueId());
@@ -777,6 +1118,9 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         Match m=playing.get(p.getUniqueId());
         if(m!=null){m.eliminated.add(p.getUniqueId());
             Bukkit.getScheduler().runTaskLater(this,()->checkRound(m),2L);}
+        Party challenge=membership.get(p.getUniqueId());
+        if(challenge!=null&&challenge.directDuel&&challenge.match==null)
+            cancelDuel(challenge,"&eDuel cancelled because a player disconnected.");
     }
     @EventHandler public void onJoin(PlayerJoinEvent event){
         Player p=event.getPlayer();
@@ -793,40 +1137,146 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         if(alive.size()>1)return;
         m.transitioning=true;
         for(BukkitTask task:m.tasks)task.cancel();m.tasks.clear();
-        if(alive.isEmpty()){partyMsg(m.party,"&eRound drawn; replaying.");m.round--; waitAndNext(m);return;}
+        if(alive.isEmpty()){
+            boolean anyoneOnline=false;
+            for(UUID u:m.party.teams.keySet())if(Bukkit.getPlayer(u)!=null){anyoneOnline=true;break;}
+            if(!anyoneOnline){finishMatch(m,"draw");return;}
+            partyMsg(m.party,"&eRound drawn; replaying.");m.round--;waitAndNext(m);return;
+        }
         String winner=alive.iterator().next();int score=m.wins.merge(winner,1,Integer::sum);
         String name=m.party.ffa ? Bukkit.getOfflinePlayer(UUID.fromString(winner)).getName() :
             "Team "+winner.substring(4);
-        partyMsg(m.party,"&6"+name+" &awon round "+m.round+"! ("+score+" win(s))");
-        if(score>=m.party.bestOf/2+1){finishMatch(m,winner);return;}
+        partyMsg(m.party,"&6"+name+" &awon round "+m.round+"! ("+score+" round wins)");
+        if(!m.party.infiniteRounds && m.round>=m.party.bestOf){
+            finishMatch(m,winningSide(m));return;
+        }
         waitAndNext(m);
+    }
+    private String winningSide(Match m){
+        String winner=null;int top=-1;boolean tied=false;
+        for(UUID u:m.party.teams.keySet()){
+            String side=m.side(u);int points=m.wins.getOrDefault(side,0);
+            if(points>top){winner=side;top=points;tied=false;}
+            else if(points==top && !side.equals(winner))tied=true;
+        }
+        return top<=0||tied?"draw":winner;
+    }
+    private String winnerName(Match m,String side){
+        if(side==null || side.equals("draw"))return "DRAW";
+        if(!m.party.ffa)return side.startsWith("team")?"Team "+side.substring(4):side;
+        try {return Bukkit.getOfflinePlayer(UUID.fromString(side)).getName();}
+        catch(Exception ignored){return side;}
     }
     private void waitAndNext(Match m){
         for(UUID u:m.party.teams.keySet()){
-            Player p=Bukkit.getPlayer(u);if(p!=null){p.setGameMode(GameMode.ADVENTURE);p.teleport(Bukkit.getWorlds().get(0).getSpawnLocation());}
+            Player p=Bukkit.getPlayer(u);
+            if(p!=null){p.setGameMode(GameMode.ADVENTURE);p.setGravity(false);
+                p.teleport(m.arena.spawns.get(0));}
         }
         Bukkit.getScheduler().runTaskLater(this,()->{if(!m.ending)beginRound(m);},60L);
+    }
+    private void cleanupDuelParty(Party party){
+        if(!party.directDuel)return;
+        duelTargets.remove(party.owner);
+        duelRequests.entrySet().removeIf(e->e.getValue()==party);
+        for(UUID u:party.teams.keySet())membership.remove(u,party);
     }
     private void finishMatch(Match m,String winner){
         if(m.ending)return;m.ending=true;
         for(BukkitTask task:m.tasks)task.cancel();m.tasks.clear();
-        String winnerName=m.party.ffa?Bukkit.getOfflinePlayer(UUID.fromString(winner)).getName():"Team "+winner.substring(4);
-        Bukkit.broadcastMessage(prefix+ChatColor.GOLD+"MATCH WINNER: "+ChatColor.GREEN+winnerName+ChatColor.GOLD+" — "+m.party.kit);
+        String winnerLabel=winnerName(m,winner);
+        for(UUID u:m.party.teams.keySet()){
+            Player p=Bukkit.getPlayer(u);
+            if(p!=null && !p.isDead() && !m.lastInventories.containsKey(u))
+                m.lastInventories.put(u,currentKit(p));
+        }
+        MatchReport report=new MatchReport(m,winnerLabel);
+        reports.put(report.id,report);
+        while(reports.size()>30){String oldest=reports.keySet().iterator().next();reports.remove(oldest);}
+        for(UUID u:m.party.teams.keySet()){
+            Player p=Bukkit.getPlayer(u);if(p==null)continue;
+            boolean victory=!winner.equals("draw") && winner.equals(m.side(u));
+            p.sendTitle(victory?ChatColor.GOLD+"VICTORY":ChatColor.RED+(winner.equals("draw")?"DRAW":"DEFEAT"),
+                ChatColor.YELLOW+"MATCH ENDED",5,55,15);
+            msg(p,"&6✦ MATCH REPORT ✦ &7Kit: &e"+report.kitName+" &7| Arena: &e"+report.arenaName);
+            msg(p,"&aWinner: &f"+winnerLabel+" &7| Round wins: &f"+report.score);
+            for(UUID member:m.party.teams.keySet()){
+                String name=Bukkit.getOfflinePlayer(member).getName();
+                String label="  "+(name==null?member.toString():name)+" [CLICK]"+
+                    " - "+report.kills.getOrDefault(member,0)+" kills / "+report.deaths.getOrDefault(member,0)+" deaths";
+                Component line=Component.text(label,NamedTextColor.YELLOW)
+                    .clickEvent(ClickEvent.runCommand("/eb report "+report.id+" "+member))
+                    .hoverEvent(HoverEvent.showText(Component.text("Inspect inventory, armor, durability and resources")));
+                p.sendMessage(line);
+            }
+            msg(p,"&7Click a name above to inspect their final fight inventory.");
+        }
         for(UUID u:m.party.teams.keySet()){
             playing.remove(u);Player p=Bukkit.getPlayer(u);PlayerBackup backup=m.backups.get(u);
-            // A dead player must respawn before their kit inventory can be safely replaced.
-            // recover-inventory.yml remains available until that respawn (or reconnect).
-            if(p!=null&&backup!=null && !p.isDead())restore(p,backup);
+            if(p!=null && backup!=null && !p.isDead()){p.setGravity(true);restore(p,backup);}
         }
         m.party.match=null;
+        cleanupDuelParty(m.party);
         m.arena.world().getWorldBorder().reset();
         resetArena(m.arena,()->{m.arena.busy=false;getLogger().info("Arena "+m.arena.id+" reset after match.");});
+    }
+    private void reportCommand(Player p,String[] args){
+        if(args.length<2){msg(p,"&cClick a username in a recent match report to inspect their items.");return;}
+        MatchReport report=reports.get(args[0]);
+        if(report==null){msg(p,"&cThat match report has expired or the server restarted.");return;}
+        UUID player;
+        try{player=UUID.fromString(args[1]);}catch(IllegalArgumentException ex){msg(p,"&cUnknown player.");return;}
+        Kit kit=report.inventories.get(player);
+        if(kit==null){msg(p,"&cNo inventory was captured for that player.");return;}
+        Menu menu=new Menu("report",null);
+        menu.inventory=Bukkit.createInventory(menu,54,"Eldritch - Inventory Report");
+        for(int i=0;i<36&&i<kit.storage.length;i++){
+            ItemStack stack=kit.storage[i];
+            if(stack!=null)menu.inventory.setItem(i,annotatedItem(stack));
+        }
+        for(int i=0;i<4&&i<kit.armor.length;i++){
+            ItemStack stack=kit.armor[i];
+            if(stack!=null)menu.inventory.setItem(36+i,annotatedItem(stack));
+        }
+        if(kit.offhand!=null)menu.inventory.setItem(40,annotatedItem(kit.offhand));
+        String name=Bukkit.getOfflinePlayer(player).getName();
+        List<String> resourceLines=new ArrayList<>();
+        resourceLines.add("&7Player: "+name);
+        resourceLines.add("&7Kills: "+report.kills.getOrDefault(player,0)+" | Deaths: "+report.deaths.getOrDefault(player,0));
+        Map<Material,Integer> counts=new LinkedHashMap<>();
+        for(ItemStack st:kit.storage)if(st!=null && !st.getType().isAir()){
+            Material material=st.getType();
+            if(material.name().contains("POTION") || material.name().contains("APPLE") ||
+                material.name().contains("CRYSTAL") || material==Material.TOTEM_OF_UNDYING ||
+                material==Material.EXPERIENCE_BOTTLE || material==Material.ENDER_PEARL ||
+                material==Material.ARROW || material==Material.OBSIDIAN || material==Material.COBWEB ||
+                material==Material.TNT || material==Material.GOLDEN_CARROT)
+                counts.merge(material,st.getAmount(),Integer::sum);
+        }
+        for(Map.Entry<Material,Integer> e:counts.entrySet()){
+            if(resourceLines.size()>=25)break;
+            resourceLines.add("&e"+e.getKey().name().toLowerCase(Locale.ROOT)+" &7x"+e.getValue());
+        }
+        menu.inventory.setItem(42,button(Material.BOOK,"&6Match resources",resourceLines.toArray(String[]::new)));
+        action(menu,49,"close",button(Material.BARRIER,"&cClose Report"));
+        p.openInventory(menu.inventory);
+    }
+    private ItemStack annotatedItem(ItemStack original){
+        ItemStack copy=original.clone();ItemMeta meta=copy.getItemMeta();
+        if(meta instanceof Damageable damageable && copy.getType().getMaxDurability()>0){
+            int max=copy.getType().getMaxDurability();int left=Math.max(0,max-damageable.getDamage());
+            List<String> lore=meta.hasLore()?new ArrayList<>(meta.getLore()):new ArrayList<>();
+            lore.add(ChatColor.GRAY+"Durability: "+left+" / "+max);
+            meta.setLore(lore);copy.setItemMeta(meta);
+        }
+        return copy;
     }
     private void restore(Player p,PlayerBackup b){
         p.getInventory().clear();p.getInventory().setStorageContents(cloneItems(b.inventory.storage));
         p.getInventory().setArmorContents(cloneItems(b.inventory.armor));
         p.getInventory().setItemInOffHand(b.inventory.offhand==null?new ItemStack(Material.AIR):b.inventory.offhand.clone());
-        p.setGameMode(b.gamemode);p.setFoodLevel(b.food);p.setFireTicks(0);
+        p.setGameMode(b.gamemode);p.setFoodLevel(b.food);p.setFireTicks(0);p.setGravity(true);
+        if(b.scoreboard!=null)p.setScoreboard(b.scoreboard);
         if(b.location.getWorld()!=null)p.teleport(b.location);
         recoveryYaml.set(p.getUniqueId().toString(),null);flushRecovery();
     }
@@ -850,6 +1300,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener {
         p.getInventory().clear();p.getInventory().setStorageContents(inv.storage);
         p.getInventory().setArmorContents(inv.armor);p.getInventory().setItemInOffHand(inv.offhand==null?new ItemStack(Material.AIR):inv.offhand);
         p.setGameMode(mode);p.setFoodLevel(recoveryYaml.getInt(key+".food",20));
+        p.setGravity(true);
         if(loc!=null&&loc.getWorld()!=null)p.teleport(loc);
         recoveryYaml.set(key,null);flushRecovery();msg(p,"&aYour inventory was restored after the previous battle.");
     }
