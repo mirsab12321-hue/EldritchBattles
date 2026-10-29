@@ -1,5 +1,5 @@
 name: EldritchBattles
-version: '0.2.2'
+version: '0.2.5'
 main: dev.eldritch.battles.EldritchBattles
 api-version: '1.21.11'
 author: Eldritch Champions
@@ -14,7 +14,7 @@ commands:
     usage: /duel <player> (or /eb duel <player>)
   party:
     description: Manage Eldritch parties
-    usage: /party create|invite|join|leave|list (or /eb party ...)
+    usage: /party create|invite|join|open|close|broadcast|kick|promote|leave (or /eb party ...)
 permissions:
   eldritch.admin:
     default: op

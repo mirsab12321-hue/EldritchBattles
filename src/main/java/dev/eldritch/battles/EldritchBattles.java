@@ -67,6 +67,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     private final Map<String, Kit> kits = new LinkedHashMap<>();
     private final Map<String, Material> kitIcons = new HashMap<>();
     private final Map<UUID, UUID> invitations = new HashMap<>();
+    private final Map<UUID, Long> lastBroadcast = new HashMap<>();
+    private Arena worldArena;
     private final Map<UUID, Party> duelRequests = new HashMap<>();
     private final Map<UUID, UUID> duelTargets = new HashMap<>();
     private final LinkedHashMap<String, MatchReport> reports = new LinkedHashMap<>();
@@ -75,11 +77,11 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     private final String prefix = ChatColor.GOLD + "[Eldritch] " + ChatColor.RESET;
 
     static class Party {
-        final UUID owner;
+        UUID owner;
         final LinkedHashMap<UUID, Integer> teams = new LinkedHashMap<>();
         boolean ffa = false, friendlyFire = false, drops = false, border = true;
         boolean healthIndicator = true, shieldStuns = true, infiniteRounds = false;
-        boolean directDuel = false;
+        boolean directDuel = false, open = false;
         int bestOf = 3; // Count of rounds, NOT best-of series. Saved field name retained for compatibility.
         String kit, arena;
         Match match;
@@ -101,7 +103,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         boolean busy;
         Arena(String id, String worldName) { this.id=id; this.worldName=worldName; }
         World world() { return Bukkit.getWorld(worldName); }
-        boolean ready() { return first != null && second != null && spawns.size() >= 2
+        boolean worldMode() { return id.equals("world"); }
+        boolean ready() { if(worldMode())return world()!=null; return first != null && second != null && spawns.size() >= 2
             && spawns.get(0) != null && spawns.get(1) != null && baseline != null && world() != null; }
         int minX(){return Math.min(first.getBlockX(), second.getBlockX());}
         int maxX(){return Math.max(first.getBlockX(), second.getBlockX());}
@@ -110,7 +113,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         int minZ(){return Math.min(first.getBlockZ(), second.getBlockZ());}
         int maxZ(){return Math.max(first.getBlockZ(), second.getBlockZ());}
         long volume(){return (long)(maxX()-minX()+1)*(maxY()-minY()+1)*(maxZ()-minZ()+1);}
-        boolean inside(Location l) {return l!=null && l.getWorld()!=null && l.getWorld().getName().equals(worldName)
+        boolean inside(Location l) {if(worldMode())return l!=null && l.getWorld()==world();return l!=null && l.getWorld()!=null && l.getWorld().getName().equals(worldName)
             && l.getBlockX()>=minX() && l.getBlockX()<=maxX() && l.getBlockY()>=minY() && l.getBlockY()<=maxY()
             && l.getBlockZ()>=minZ() && l.getBlockZ()<=maxZ();}
     }
@@ -143,6 +146,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         final Map<String,Integer> wins=new HashMap<>();
         final Map<UUID,PlayerBackup> backups=new HashMap<>();
         final Map<UUID,Kit> lastInventories=new HashMap<>();
+        final Map<UUID,Location> worldSpawns=new LinkedHashMap<>();
         final Map<UUID,Integer> deaths=new HashMap<>(), kills=new HashMap<>();
         final List<BukkitTask> tasks = new ArrayList<>();
         // Only blocks placed while this match is active may be mined/exploded in this arena world.
@@ -190,10 +194,11 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         kitsYaml=YamlConfiguration.loadConfiguration(kitsFile);
         recoveryYaml=YamlConfiguration.loadConfiguration(recoveryFile);
         loadKits(); loadArenas();
+        worldArena=new Arena("world",getConfig().getString("world-duels.world","world"));
         // Restore a sane border after an interrupted match/restart in a plugin-owned arena world.
-        for(Arena arena:arenas.values())if(arena.world()!=null)arena.world().getWorldBorder().reset();
+        for(Arena arena:arenas.values())if(!arena.worldMode() && arena.world()!=null)arena.world().getWorldBorder().reset();
         getServer().getPluginManager().registerEvents(this,this);
-        getLogger().info("Eldritch Battles v0.2.2 enabled. Use /eb help");
+        getLogger().info("Eldritch Battles v0.2.5 enabled. Use /eb help");
     }
     @Override public void onDisable(){
         for(Match match: new HashSet<>(playing.values())){
@@ -215,6 +220,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     private void help(Player p){
         msg(p,"&6/duel <player> &7(1v1 challenge; /duel accept <player>)");
         msg(p,"&6/party create | invite <player> | join <owner> | leave | list");
+        msg(p,"&6/party open | close | broadcast | kick <player> | promote <player>");
         msg(p,"&e/eb menu &7(party home / team battles)");
         msg(p,"&e/eb stop &7(end your infinite-round match)");
         msg(p,"&e/eb kit save|icon|list|delete <name> &7(admin)");
@@ -251,21 +257,21 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             else if(a.length==2 && (a[0].equalsIgnoreCase("accept")||a[0].equalsIgnoreCase("deny")))
                 for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());
         }else if(root.equals("party")){
-            if(a.length==1)values.addAll(List.of("create","invite","join","leave","disband","list","menu"));
-            if(a.length==2&&(a[0].equalsIgnoreCase("invite")||a[0].equalsIgnoreCase("join")))
+            if(a.length==1)values.addAll(List.of("create","invite","join","leave","disband","list","menu","open","close","broadcast","kick","promote"));
+            if(a.length==2&&(a[0].equalsIgnoreCase("invite")||a[0].equalsIgnoreCase("join")||a[0].equalsIgnoreCase("kick")||a[0].equalsIgnoreCase("promote")))
                 for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());
         }else if(a.length==1)values.addAll(List.of("menu","duel","party","kit","arena","stop","report","help"));
         else if(a.length==2){
             switch(a[0].toLowerCase(Locale.ROOT)){
                 case "duel" -> {values.addAll(List.of("accept","deny","cancel"));for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());}
-                case "party" -> values.addAll(List.of("create","invite","join","leave","disband","list","menu"));
+                case "party" -> values.addAll(List.of("create","invite","join","leave","disband","list","menu","open","close","broadcast","kick","promote"));
                 case "kit" -> values.addAll(List.of("save","list","delete","icon"));
                 case "arena" -> values.addAll(List.of("create","edit","pos1","pos2","spawn","save","list","inspect","recover"));
             }
         }else if(a.length==3){
             if(a[0].equalsIgnoreCase("kit"))values.addAll(kits.keySet());
             if(a[0].equalsIgnoreCase("arena"))values.addAll(arenas.keySet());
-            if(a[0].equalsIgnoreCase("party")&&(a[1].equalsIgnoreCase("invite")||a[1].equalsIgnoreCase("join")))
+            if(a[0].equalsIgnoreCase("party")&&(a[1].equalsIgnoreCase("invite")||a[1].equalsIgnoreCase("join")||a[1].equalsIgnoreCase("kick")||a[1].equalsIgnoreCase("promote")))
                 for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());
         }else if(a.length==4 && a[0].equalsIgnoreCase("arena") && a[1].equalsIgnoreCase("spawn"))
             values.addAll(List.of("1","2"));
@@ -324,8 +330,20 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         if(duelRequests.containsKey(targetUuid)){msg(host,"&cThat player already has a pending challenge.");return;}
         duelRequests.put(targetUuid,party);
         msg(host,"&eChallenge sent to &f"+target.getName()+"&e. Awaiting acceptance.");
-        msg(target,"&6"+host.getName()+" challenged you! &eKit: "+party.kit+" &7Arena: "+arena.id);
-        openDuelRequest(target,party);
+        // Lock the arena actually offered, so the accepted challenge cannot silently switch maps.
+        party.arena=arena.id;
+        String mode=party.ffa?"FFA":"1v1";
+        String rounds=party.infiniteRounds?"Infinite":Integer.toString(party.bestOf);
+        target.sendMessage(Component.text("✧ DUEL REQUEST ✧",NamedTextColor.GOLD));
+        target.sendMessage(Component.text(host.getName()+" wants to duel you.",NamedTextColor.YELLOW));
+        target.sendMessage(Component.text("Gamemode: "+party.kit+" ("+mode+")",NamedTextColor.GRAY));
+        target.sendMessage(Component.text("Arena: "+arena.id+"   Rounds: "+rounds,NamedTextColor.GRAY));
+        target.sendMessage(Component.text("[CLICK TO ACCEPT]",NamedTextColor.GREEN)
+            .clickEvent(ClickEvent.runCommand("/eb duel accept "+host.getName()))
+            .hoverEvent(HoverEvent.showText(Component.text("Accept duel from "+host.getName())))
+            .append(Component.text("    "))
+            .append(Component.text("[DECLINE]",NamedTextColor.RED)
+                .clickEvent(ClickEvent.runCommand("/eb duel deny "+host.getName()))));
         Bukkit.getScheduler().runTaskLater(this,()->{
             if(duelRequests.get(targetUuid)==party)cancelDuel(party,"&cDuel request expired after 60 seconds.");
         },1200L);
@@ -367,15 +385,21 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
                 Player target=Bukkit.getPlayerExact(args[1]);
                 if(target==null||membership.containsKey(target.getUniqueId())){msg(p,"&cPlayer offline or already in a party.");return;}
                 invitations.put(target.getUniqueId(),party.owner);
-                msg(target,"&6"+p.getName()+" invited you! &a/eb party join "+p.getName());
+                target.sendMessage(Component.text(p.getName()+" invited you to their party! ",NamedTextColor.LIGHT_PURPLE)
+                    .append(Component.text("[CLICK TO JOIN]",NamedTextColor.GREEN)
+                        .clickEvent(ClickEvent.runCommand("/eb party join "+p.getName()))
+                        .hoverEvent(HoverEvent.showText(Component.text("Join "+p.getName()+"'s party")))));
                 msg(p,"&aInvite sent to "+target.getName());
             }
             case "join" -> {
                 if(party!=null||args.length<2){msg(p,"&cUsage: /eb party join <host>; leave current party first.");return;}
                 Player host=Bukkit.getPlayerExact(args[1]);
-                if(host==null || !host.getUniqueId().equals(invitations.get(p.getUniqueId()))){msg(p,"&cNo valid invitation from that host.");return;}
+                if(host==null){msg(p,"&cHost is offline.");return;}
                 Party joined=membership.get(host.getUniqueId());
-                if(joined==null||!joined.owner.equals(host.getUniqueId())||joined.match!=null){msg(p,"&cParty unavailable.");return;}
+                if(joined==null || !joined.owner.equals(host.getUniqueId()) || joined.match!=null){msg(p,"&cParty unavailable.");return;}
+                if(!joined.open && !host.getUniqueId().equals(invitations.get(p.getUniqueId()))){
+                    msg(p,"&cThat party is private. Ask the owner to invite you.");return;
+                }
                 if(joined.teams.size()>=16){msg(p,"&cParty is full.");return;}
                 joined.teams.put(p.getUniqueId(),2);membership.put(p.getUniqueId(),joined);
                 invitations.remove(p.getUniqueId());partyMsg(joined,"&a"+p.getName()+" joined the party!");
@@ -387,6 +411,40 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
                     for(UUID u:party.teams.keySet())membership.remove(u);
                     partyMsg(party,"&cParty disbanded.");
                 } else {party.teams.remove(p.getUniqueId());membership.remove(p.getUniqueId());partyMsg(party,"&e"+p.getName()+" left.");}
+            }
+            case "open", "close" -> {
+                if(!isLeader(p,party)){msg(p,"&cOnly the leader can change party privacy.");return;}
+                party.open=args[0].equalsIgnoreCase("open");
+                partyMsg(party,party.open?"&aParty is PUBLIC. Anyone can /party join "+p.getName():
+                    "&eParty is PRIVATE. Players need an invitation.");
+            }
+            case "broadcast" -> {
+                if(!isLeader(p,party) || party.match!=null){msg(p,"&cOnly a free party leader can broadcast.");return;}
+                if(!party.open){msg(p,"&cOpen the party before broadcasting: /party open");return;}
+                long now=System.currentTimeMillis();
+                if(now-lastBroadcast.getOrDefault(party.owner,0L)<30000){msg(p,"&cWait 30 seconds between broadcasts.");return;}
+                lastBroadcast.put(party.owner,now);
+                Component announcement=Component.text("✧ "+p.getName()+"'s party is open to the public! ",NamedTextColor.LIGHT_PURPLE)
+                    .append(Component.text("[Click to join]",NamedTextColor.GREEN)
+                        .clickEvent(ClickEvent.runCommand("/eb party join "+p.getName())));
+                for(Player online:Bukkit.getOnlinePlayers())online.sendMessage(announcement);
+            }
+            case "kick", "promote" -> {
+                if(!isLeader(p,party) || party.match!=null){msg(p,"&cOnly a leader outside a match can manage members.");return;}
+                if(args.length<2){msg(p,"&cUsage: /party "+args[0]+" <member>");return;}
+                Player target=Bukkit.getPlayerExact(args[1]);
+                if(target==null || !party.teams.containsKey(target.getUniqueId()) || target.getUniqueId().equals(party.owner)){
+                    msg(p,"&cChoose another online party member.");return;
+                }
+                if(args[0].equalsIgnoreCase("kick")){
+                    party.teams.remove(target.getUniqueId());membership.remove(target.getUniqueId(),party);
+                    msg(target,"&cYou were kicked from the party.");partyMsg(party,"&e"+target.getName()+" was kicked.");
+                }else{
+                    party.owner=target.getUniqueId();
+                    // Invites tied to the old leader no longer apply to this party.
+                    invitations.entrySet().removeIf(e->e.getValue().equals(p.getUniqueId()));
+                    partyMsg(party,"&a"+target.getName()+" is now the party leader!");
+                }
             }
             case "list" -> {
                 if(party==null){msg(p,"&cNot in a party.");return;}
@@ -453,11 +511,13 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         if(a.length==0){msg(p,"&e/eb arena create|edit|pos1|pos2|spawn|save|list");return;}
         if(a[0].equalsIgnoreCase("list")){
             for(Arena arena:arenas.values())msg(p,"&e"+arena.id+" &7world="+arena.worldName+" ready="+arena.ready()+" spawns="+arena.spawns.size());
+            if(worldArena!=null)msg(p,"&eWorld &7normal world="+worldArena.worldName+" available="+worldArena.ready()+" (no snapshot required)");
             return;
         }
         if(a.length<2){msg(p,"&cSupply arena name.");return;}
         String id=validId(a[1]);if(id==null){msg(p,"&cInvalid arena name.");return;}
         if(a[0].equalsIgnoreCase("create")){
+            if(id.equals("world")){msg(p,"&cWorld is a special no-reset duel option; it cannot be created as a builder arena.");return;}
             if(arenas.containsKey(id)){msg(p,"&cArena already exists. Use /eb arena edit "+id);return;}
             Arena arena=new Arena(id,"eldritch_"+id);
             World world=loadWorld(arena.worldName);
@@ -494,7 +554,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
                 ar.first=first;ar.second=second;ar.baseline=records;saveArenas();
                 msg(p,"&aRecovered arena corners from snapshot, volume="+volume+". No blocks were changed.");
             }
-            case "edit" -> {World w=ar.world();if(w!=null)p.teleport(ar.spawns.isEmpty()?new Location(w,0.5,80,0.5):ar.spawns.get(0));}
+            case "edit" -> {World w=ar.world();if(w!=null)p.teleport(ar.spawns.isEmpty() || ar.spawns.get(0)==null?
+                new Location(w,0.5,80,0.5):ar.spawns.get(0));}
             case "pos1" -> {if(!inArenaWorld(p,ar))return;ar.first=p.getLocation().clone();ar.baseline=null;saveArenas();msg(p,"&aCorner 1 set.");}
             case "pos2" -> {if(!inArenaWorld(p,ar))return;ar.second=p.getLocation().clone();ar.baseline=null;saveArenas();msg(p,"&aCorner 2 set.");}
             case "spawn" -> {
@@ -565,43 +626,48 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             return blocks;
         }catch(Exception e){getLogger().severe("Could not load snapshot "+ar.id+": "+e);return null;}
     }
-    private void resetArena(Arena ar,Runnable complete){
-        World world=ar.world();if(world==null||ar.baseline==null){getLogger().severe("Missing saved arena "+ar.id);return;}
-        // Remove combat leftovers, but not players/decorative armor stands.
+    /** Restore only changed baseline blocks and player-placed blocks, instead of clearing the entire cuboid.
+     * Batch the scan to keep the main server thread responsive. */
+    private void resetArena(Arena ar,Set<BlockKey> placed,Runnable complete){
+        if(ar.worldMode()){complete.run();return;}
+        World world=ar.world();
+        if(world==null || ar.baseline==null){getLogger().severe("Missing saved arena "+ar.id);complete.run();return;}
         for(Entity entity:world.getEntities()){
-            if(entity instanceof Item || entity instanceof Projectile || entity instanceof TNTPrimed || entity instanceof EnderCrystal ||
-                    entity.getType().name().contains("MINECART") && entity.getType()!=org.bukkit.entity.EntityType.MINECART){
-                if(ar.inside(entity.getLocation()))entity.remove();
-            }
+            if((entity instanceof Item || entity instanceof Projectile || entity instanceof TNTPrimed ||
+                entity instanceof EnderCrystal || entity.getType().name().contains("MINECART"))
+                && ar.inside(entity.getLocation()))entity.remove();
         }
-        final int minX=ar.minX(),minY=ar.minY(),minZ=ar.minZ();
-        final int sx=ar.maxX()-minX+1, sz=ar.maxZ()-minZ+1;
-        final long total=ar.volume();
-        int rate=Math.max(100,Math.min(10000,getConfig().getInt("reset-blocks-per-tick",1200)));
+        final Map<BlockKey,BlockRecord> originals=new HashMap<>();
+        for(BlockRecord record:ar.baseline)originals.put(new BlockKey(record.x,record.y,record.z),record);
+        final List<BlockKey> additions=new ArrayList<>();
+        for(BlockKey key:placed)if(!originals.containsKey(key))additions.add(key);
+        final int rate=Math.max(200,Math.min(20000,getConfig().getInt("reset-blocks-per-tick",5000)));
         new BukkitRunnable(){
-            long index=0;int put=0;int phase=0;
+            int clear=0,scan=0;
             @Override public void run(){
                 int count=0;
-                if(phase==0){
-                    while(index<total && count<rate){
-                        int x=minX+(int)(index%sx),z=minZ+(int)((index/sx)%sz),y=minY+(int)(index/(sx*sz));
-                        world.getBlockAt(x,y,z).setType(Material.AIR,false);index++;count++;
-                    }
-                    if(index>=total)phase=1;
-                }else{
-                    while(put<ar.baseline.size() && count<rate){
-                        BlockRecord r=ar.baseline.get(put++);
-                        try{Block b=world.getBlockAt(r.x,r.y,r.z);b.setBlockData(Bukkit.createBlockData(r.data),false);
-                            if(r.inventory!=null && b.getState() instanceof Container c){
-                                c.getInventory().setContents(cloneItems(r.inventory));c.update(true,false);
-                            }
-                        }catch(Exception ex){getLogger().warning("Bad arena block: "+ex.getMessage());}
-                        count++;
-                    }
-                    if(put>=ar.baseline.size()){cancel();complete.run();}
+                while(clear<additions.size() && count<rate){
+                    BlockKey key=additions.get(clear++);
+                    world.getBlockAt(key.x(),key.y(),key.z()).setType(Material.AIR,false);
+                    count++;
                 }
+                while(scan<ar.baseline.size() && count<rate){
+                    BlockRecord original=ar.baseline.get(scan++);
+                    Block block=world.getBlockAt(original.x,original.y,original.z);
+                    try{
+                        if(!block.getBlockData().getAsString().equals(original.data))
+                            block.setBlockData(Bukkit.createBlockData(original.data),false);
+                        if(original.inventory!=null && block.getState() instanceof Container c){
+                            if(!Arrays.equals(c.getInventory().getContents(),original.inventory)){
+                                c.getInventory().setContents(cloneItems(original.inventory));c.update(true,false);
+                            }
+                        }
+                    }catch(Exception ex){getLogger().warning("Could not restore arena block: "+ex.getMessage());}
+                    count++;
+                }
+                if(clear>=additions.size() && scan>=ar.baseline.size()){cancel();complete.run();}
             }
-        }.runTaskTimer(this,1,1);
+        }.runTaskTimer(this,1L,1L);
     }
     private void saveKits(){
         for(String key:new HashSet<>(kitsYaml.getKeys(false)))kitsYaml.set(key,null);
@@ -630,24 +696,84 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             }
         }
     }
+    /** Saves anchors twice: Bukkit Locations plus plain numeric fallback in separate file.
+     * This prevents a broken location deserializer/update from erasing arena setup. */
+    private File anchorsFile(Arena ar){
+        File folder=new File(getDataFolder(),"arena-anchors");folder.mkdirs();
+        return new File(folder,ar.id+".yml");
+    }
+    private void storePlainLocation(YamlConfiguration cfg,String key,Location loc){
+        if(loc==null || loc.getWorld()==null)return;
+        cfg.set(key+".world",loc.getWorld().getName());
+        cfg.set(key+".x",loc.getX());cfg.set(key+".y",loc.getY());cfg.set(key+".z",loc.getZ());
+        cfg.set(key+".yaw",loc.getYaw());cfg.set(key+".pitch",loc.getPitch());
+    }
+    private Location readPlainLocation(YamlConfiguration cfg,String key,World defaultWorld){
+        if(!cfg.contains(key+".x") || defaultWorld==null)return null;
+        World w=Bukkit.getWorld(cfg.getString(key+".world",defaultWorld.getName()));
+        if(w==null || !w.equals(defaultWorld))return null;
+        return new Location(w,cfg.getDouble(key+".x"),cfg.getDouble(key+".y"),cfg.getDouble(key+".z"),
+            (float)cfg.getDouble(key+".yaw"),(float)cfg.getDouble(key+".pitch"));
+    }
     private void saveArenas(){
         for(String k:new HashSet<>(arenaYaml.getKeys(false)))arenaYaml.set(k,null);
         for(Arena a:arenas.values()){
             String path=a.id;arenaYaml.set(path+".world",a.worldName);
             arenaYaml.set(path+".pos1",a.first);arenaYaml.set(path+".pos2",a.second);
             arenaYaml.set(path+".spawns",new ArrayList<>(a.spawns));
+            storePlainLocation(arenaYaml,path+".backup-pos1",a.first);
+            storePlainLocation(arenaYaml,path+".backup-pos2",a.second);
+            YamlConfiguration safe=YamlConfiguration.loadConfiguration(anchorsFile(a));
+            // Never delete a previously saved fallback when the live location is missing.
+            storePlainLocation(safe,"pos1",a.first);storePlainLocation(safe,"pos2",a.second);
+            for(int i=0;i<a.spawns.size();i++)storePlainLocation(safe,"spawn"+(i+1),a.spawns.get(i));
+            try{safe.save(anchorsFile(a));}catch(IOException e){getLogger().severe("Anchor backup failed for "+a.id+": "+e);}
         }
-        try{arenaYaml.save(arenaFile);}catch(IOException e){getLogger().severe("arenas.yml save failed: "+e);}
+        try{
+            if(arenaFile.isFile())java.nio.file.Files.copy(arenaFile.toPath(),
+                new File(getDataFolder(),"arenas.yml.previous").toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            arenaYaml.save(arenaFile);
+        }catch(IOException e){getLogger().severe("arenas.yml save failed: "+e);}
+    }
+    private void recoverSnapshotBounds(Arena a){
+        if(a.baseline==null || a.baseline.isEmpty() || (a.first!=null && a.second!=null))return;
+        int minX=Integer.MAX_VALUE,minY=Integer.MAX_VALUE,minZ=Integer.MAX_VALUE;
+        int maxX=Integer.MIN_VALUE,maxY=Integer.MIN_VALUE,maxZ=Integer.MIN_VALUE;
+        for(BlockRecord b:a.baseline){
+            minX=Math.min(minX,b.x);minY=Math.min(minY,b.y);minZ=Math.min(minZ,b.z);
+            maxX=Math.max(maxX,b.x);maxY=Math.max(maxY,b.y);maxZ=Math.max(maxZ,b.z);
+        }
+        long volume=(long)(maxX-minX+1)*(maxY-minY+1)*(maxZ-minZ+1);
+        if(volume<=0 || volume>getConfig().getLong("max-snapshot-blocks",250000))return;
+        // Snapshot contains non-air coordinates only, so these are approximate backup bounds.
+        World world=a.world();if(world==null)return;
+        if(a.first==null)a.first=new Location(world,minX,minY,minZ);
+        if(a.second==null)a.second=new Location(world,maxX,maxY,maxZ);
+        getLogger().warning("Recovered missing corners for "+a.id+" from saved snapshot. Inspect bounds before fighting.");
     }
     private void loadArenas(){
+        arenas.clear();
         for(String id:arenaYaml.getKeys(false)){
             String worldName=arenaYaml.getString(id+".world","eldritch_"+id);
             World w=loadWorld(worldName);
             if(w==null)continue;
             Arena a=new Arena(id,worldName);
+            YamlConfiguration safe=YamlConfiguration.loadConfiguration(anchorsFile(a));
             a.first=arenaYaml.getLocation(id+".pos1");a.second=arenaYaml.getLocation(id+".pos2");
-            for(Object obj:arenaYaml.getList(id+".spawns",Collections.emptyList()))if(obj instanceof Location loc)a.spawns.add(loc);
-            if(a.first!=null&&a.second!=null)a.baseline=loadSnapshot(a);
+            if(a.first==null)a.first=readPlainLocation(arenaYaml,id+".backup-pos1",w);
+            if(a.second==null)a.second=readPlainLocation(arenaYaml,id+".backup-pos2",w);
+            if(a.first==null)a.first=readPlainLocation(safe,"pos1",w);
+            if(a.second==null)a.second=readPlainLocation(safe,"pos2",w);
+            for(Object obj:arenaYaml.getList(id+".spawns",Collections.emptyList()))
+                if(obj instanceof Location loc && loc.getWorld()!=null)a.spawns.add(loc);
+            for(int i=0;i<16;i++){
+                Location saved=readPlainLocation(safe,"spawn"+(i+1),w);
+                if(saved!=null){while(a.spawns.size()<=i)a.spawns.add(null);
+                    if(a.spawns.get(i)==null)a.spawns.set(i,saved);}
+            }
+            a.baseline=loadSnapshot(a);
+            recoverSnapshotBounds(a);
             arenas.put(id,a);
         }
     }
@@ -673,6 +799,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         Menu menu=new Menu(page,party);
         String title=switch(page){
             case "home" -> "Eldritch - Party Menu";
+            case "members" -> "Eldritch - Party Members";
             case "teams" -> "Eldritch - Team Battle";
             case "kits" -> "Eldritch - Select Kit";
             case "arenas" -> "Eldritch - Choose Arena";
@@ -687,11 +814,30 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             ItemStack head=new ItemStack(Material.PLAYER_HEAD);
             SkullMeta meta=(SkullMeta)head.getItemMeta();meta.setOwningPlayer(owner);
             meta.setDisplayName(ChatColor.GOLD+"Owner: "+owner.getName());
-            meta.setLore(List.of(ChatColor.GRAY+"Members: "+party.teams.size(),ChatColor.YELLOW+"/party invite <name>"));
-            head.setItemMeta(meta);menu.inventory.setItem(4,head);
+            meta.setLore(List.of(ChatColor.GRAY+"Members: "+party.teams.size(),ChatColor.YELLOW+"Click to configure party members"));
+            head.setItemMeta(meta);action(menu,4,"members",head);
+            action(menu,20,"privacy",button(Material.OAK_SIGN,party.open?"&cClose Your Party":"&aOpen Your Party",
+                party.open?"&7Click to make invite-only":"&7Click to allow /party join <owner>"));
             action(menu,22,"teams",button(Material.NETHERITE_SWORD,"&6Party Team Battle","&7Teams → Kit → Match Settings"));
+            action(menu,24,"broadcast",button(Material.GOAT_HORN,"&dBroadcast Party","&7Send public pink chat invite","&7Party must be open; 30s cooldown"));
             action(menu,31,"leave",button(Material.BARRIER,"&cDisband Party","&7Leader disbands; members leave"));
             if(party.directDuel)action(menu,24,"kits",button(Material.DIAMOND_SWORD,"&eDirect Duel","&7Select a kit"));
+        }else if(page.equals("members")){
+            int i=10;
+            for(UUID memberId:party.teams.keySet()){
+                if(i>=44)break;
+                OfflinePlayer member=Bukkit.getOfflinePlayer(memberId);
+                ItemStack head=new ItemStack(Material.PLAYER_HEAD);
+                SkullMeta meta=(SkullMeta)head.getItemMeta();meta.setOwningPlayer(member);
+                String name=member.getName()==null?memberId.toString():member.getName();
+                meta.setDisplayName(ChatColor.LIGHT_PURPLE+name+(memberId.equals(party.owner)?" ★":""));
+                meta.setLore(memberId.equals(party.owner)?
+                    List.of(ChatColor.GOLD+"Party leader"):
+                    List.of(ChatColor.YELLOW+"Left-click: Kick",ChatColor.YELLOW+"Right-click: Transfer leadership"));
+                head.setItemMeta(meta);
+                action(menu,i++,"member:"+memberId,head);
+            }
+            action(menu,45,"home",button(Material.BARRIER,"&cBack to Party Menu"));
         }else if(page.equals("teams")){
             for(int i=9;i<27;i++)menu.inventory.setItem(i,button(Material.RED_STAINED_GLASS_PANE,"&cTeam 1"));
             for(int i=27;i<45;i++)menu.inventory.setItem(i,button(Material.BLUE_STAINED_GLASS_PANE,"&9Team 2"));
@@ -720,6 +866,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         }else if(page.equals("arenas")){
             action(menu,0,"arena:auto",button(Material.ENDER_EYE,"&eRandom Available Arena",
                 "&7Automatically selects a ready, unused arena"));
+            action(menu,8,"arena:world",button(Material.GRASS_BLOCK,"&aWorld (Random Coordinates)",
+                "&7Safe random positions in the normal world", "&7No region snapshot or regeneration", "&cPlaced blocks remain in the world"));
             int i=1;
             for(Arena a:arenas.values()){
                 if(i>=45)break;
@@ -782,6 +930,21 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         Party party=membership.get(p.getUniqueId());
         if(party==null||party!=menu.party){p.closeInventory();return;}
         if(!isLeader(p,party)){msg(p,"&cOnly the party leader can configure this menu.");return;}
+        if(action.startsWith("member:")){
+            UUID member=UUID.fromString(action.substring(7));
+            if(member.equals(party.owner)){msg(p,"&eYou cannot kick yourself; use Disband Party.");return;}
+            Player target=Bukkit.getPlayer(member);
+            if(target==null){msg(p,"&cThat member must be online.");return;}
+            partyCommand(p,new String[]{event.isRightClick()?"promote":"kick",target.getName()});
+            Bukkit.getScheduler().runTask(this,()->{if(p.isOnline())openMenu(p,"members");});return;
+        }
+        if(action.equals("privacy")){
+            partyCommand(p,new String[]{party.open?"close":"open"});
+            Bukkit.getScheduler().runTask(this,()->openMenu(p,"home"));return;
+        }
+        if(action.equals("broadcast")){
+            partyCommand(p,new String[]{"broadcast"});return;
+        }
         String next=menu.page;
         if(action.startsWith("swap:")){
             if(!party.ffa){UUID uuid=UUID.fromString(action.substring(5));
@@ -791,7 +954,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         else if(action.startsWith("kit:")){party.kit=action.substring(4);next="settings";}
         else if(action.startsWith("arena:")){
             String id=action.substring(6);
-            if(!id.equals("auto") && !arenas.containsKey(id))return;
+            if(!id.equals("auto") && !id.equals("world") && !arenas.containsKey(id))return;
             party.arena=id.equals("auto")?null:id;next="settings";
         }else if(action.startsWith("r:")){
             if(action.equals("r:inf"))party.infiniteRounds=!party.infiniteRounds;
@@ -803,7 +966,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             }
             next="rounds";
         }else switch(action){
-            case "home","teams","kits","settings","duelSettings","arenaMenu" ->
+            case "home","members","teams","kits","settings","duelSettings","arenaMenu" ->
                 next=action.equals("arenaMenu")?"arenas":action;
             case "back" -> next=party.directDuel?"settings":"teams";
             case "rounds" -> {
@@ -830,11 +993,13 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     }
     private Arena resolveArena(Party party){
         if(party.arena!=null){
-            Arena selected=arenas.get(party.arena);
+            Arena selected=party.arena.equals("world")?worldArena:arenas.get(party.arena);
             return selected!=null && selected.ready() && !selected.busy?selected:null;
         }
         List<Arena> ready=new ArrayList<>();
         for(Arena a:arenas.values())if(a.ready()&&!a.busy)ready.add(a);
+        if(getConfig().getBoolean("world-duels.include-in-random",true)
+            && worldArena!=null && worldArena.ready() && !worldArena.busy)ready.add(worldArena);
         return ready.isEmpty()?null:ready.get(ThreadLocalRandom.current().nextInt(ready.size()));
     }
     private void startMatch(Player owner,Party party){
@@ -852,21 +1017,27 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         if(party.kit==null||!kits.containsKey(party.kit)){msg(owner,"&cSelect a saved kit first.");return;}
         Arena arena=resolveArena(party);
         if(arena==null){msg(owner,"&cNo available ready arena. Check /eb arena inspect <name>.");return;}
-        if(arena.spawns.size()<2 || arena.spawns.get(0)==null || arena.spawns.get(1)==null){
+        if(!arena.worldMode() && (arena.spawns.size()<2 || arena.spawns.get(0)==null || arena.spawns.get(1)==null)){
             msg(owner,"&cSet Team 1/2 spawns with /eb arena spawn "+arena.id+" 1 or 2.");return;
         }
         Map<UUID,Location> initial=new LinkedHashMap<>();
-        for(Map.Entry<UUID,Integer> entry:party.teams.entrySet()){
-            int team=party.ffa?1:entry.getValue();
-            Location anchor=arena.spawns.get(team==2?1:0);
-            if(anchor==null || !anchor.getWorld().equals(arena.world())){
-                msg(owner,"&cSaved spawn points are missing/incorrect. Use /eb arena spawn "+arena.id+" 1/2.");return;
+        if(arena.worldMode()){
+            initial=chooseWorldSpawns(arena,party);
+            if(initial==null){msg(owner,"&cCould not find enough safe ground in the configured world. Try again or select a custom arena.");return;}
+        }else{
+            for(Map.Entry<UUID,Integer> entry:party.teams.entrySet()){
+                int team=party.ffa?1:entry.getValue();
+                Location anchor=arena.spawns.get(team==2?1:0);
+                if(anchor==null || !anchor.getWorld().equals(arena.world())){
+                    msg(owner,"&cSaved spawn points are missing/incorrect. Use /eb arena spawn "+arena.id+" 1/2.");return;
+                }
+                initial.put(entry.getKey(),anchor.clone());
             }
-            initial.put(entry.getKey(),anchor.clone());
         }
         arena.busy=true;
         Match m=new Match(party,arena,kits.get(party.kit));party.match=m;
-        setupBorder(m); // Set CENTER before size and BEFORE anyone teleports; avoids previous border damage.
+        if(arena.worldMode())m.worldSpawns.putAll(initial);
+        setupBorder(m); // Do not modify the main world's shared border for World duels.
         for(UUID u:party.teams.keySet()){
             Player p=Bukkit.getPlayer(u);
             PlayerBackup backup=new PlayerBackup(p);m.backups.put(u,backup);
@@ -880,7 +1051,55 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             +" | "+(party.infiniteRounds?"Infinite rounds":party.bestOf+" rounds"));
         beginRound(m);
     }
+    /** Ground-based World duels. Limited searches around one randomly chosen region avoid long teleports.
+     * This mode intentionally does NOT save/reset the overworld or modify its world border. */
+    private Map<UUID,Location> chooseWorldSpawns(Arena arena,Party party){
+        World w=arena.world();if(w==null)return null;
+        ThreadLocalRandom rng=ThreadLocalRandom.current();
+        int min=Math.max(256,getConfig().getInt("world-duels.minimum-distance",1200));
+        int max=Math.max(min+128,getConfig().getInt("world-duels.maximum-distance",4000));
+        for(int region=0;region<8;region++){
+            int centerX=(rng.nextBoolean()?1:-1)*rng.nextInt(min,max);
+            int centerZ=(rng.nextBoolean()?1:-1)*rng.nextInt(min,max);
+            Map<UUID,Location> result=new LinkedHashMap<>();
+            List<Location> used=new ArrayList<>();
+            boolean found=true;int playerIndex=0;
+            for(Map.Entry<UUID,Integer> entry:party.teams.entrySet()){
+                int team=party.ffa?playerIndex:entry.getValue()-1;
+                // Separate teams, and spread FFA participants around the center.
+                double angle=party.ffa?(playerIndex*2.0*Math.PI/party.teams.size()):team*Math.PI;
+                int ring=party.ffa?Math.max(14,party.teams.size()*3):18;
+                int baseX=centerX+(int)Math.round(ring*Math.cos(angle));
+                int baseZ=centerZ+(int)Math.round(ring*Math.sin(angle));
+                Location picked=null;
+                for(int trial=0;trial<12;trial++){
+                    int x=baseX+rng.nextInt(-6,7),z=baseZ+rng.nextInt(-6,7);
+                    Location candidate=safeWorldGround(w,x,z);
+                    if(candidate!=null && separated(candidate,used,2.5)){
+                        picked=candidate;break;
+                    }
+                }
+                if(picked==null){found=false;break;}
+                picked.setYaw((float)Math.toDegrees(Math.atan2(centerZ-picked.getZ(),centerX-picked.getX()))-90f);
+                result.put(entry.getKey(),picked);used.add(picked);playerIndex++;
+            }
+            if(found)return result;
+        }
+        return null;
+    }
+    private Location safeWorldGround(World w,int x,int z){
+        // getHighestBlockYAt loads/generates the chunk; only call synchronously from the server thread.
+        int y=w.getHighestBlockYAt(x,z)+1;
+        if(y<=w.getMinHeight()+2 || y>=w.getMaxHeight()-2)return null;
+        Material floor=w.getBlockAt(x,y-1,z).getType();
+        if(!floor.isSolid() || floor.name().contains("LEAVES") || floor==Material.MAGMA_BLOCK ||
+           floor==Material.CACTUS || floor==Material.CAMPFIRE || floor==Material.SOUL_CAMPFIRE ||
+           floor==Material.POWDER_SNOW || floor==Material.BEDROCK)return null;
+        if(!w.getBlockAt(x,y,z).isPassable() || !w.getBlockAt(x,y+1,z).isPassable())return null;
+        return new Location(w,x+0.5,y,z+0.5);
+    }
     private void setupBorder(Match m){
+        if(m.arena.worldMode())return; // A world border affects EVERY player in the overworld.
         WorldBorder border=m.arena.world().getWorldBorder();
         border.reset();
         double centerX=(m.arena.minX()+m.arena.maxX()+1)/2.0;
@@ -898,7 +1117,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         for(BukkitTask task:m.tasks)task.cancel();m.tasks.clear();
         setupBorder(m);
         partyMsg(m.party,"&ePreparing saved arena blocks...");
-        resetArena(m.arena,()->{
+        resetArena(m.arena,m.placedBlocks,()->{
             if(m.ending)return;
             m.round++;m.eliminated.clear();m.lastInventories.clear();
             m.placedBlocks.clear(); // Reset has removed all placed blocks from the previous round.
@@ -933,7 +1152,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
                             Player p=Bukkit.getPlayer(u);
                             if(p!=null)p.sendTitle(ChatColor.GREEN+"FIGHT!",ChatColor.YELLOW+"Round "+m.round,0,25,10);
                         }
-                        if(m.party.border && getConfig().getBoolean("border.enabled",true)){
+                        if(!m.arena.worldMode() && m.party.border && getConfig().getBoolean("border.enabled",true)){
                             WorldBorder b=m.arena.world().getWorldBorder();
                             b.setDamageAmount(0.2);
                             int delay=Math.max(1,getConfig().getInt("border.delay-seconds",480));
@@ -1046,6 +1265,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     }
     private Map<UUID,Location> chooseRoundSpawns(Match match){
         Arena arena=match.arena;
+        if(arena.worldMode())return new LinkedHashMap<>(match.worldSpawns);
         Map<UUID,Location> chosen=new LinkedHashMap<>();
         List<Location> used=new ArrayList<>();
         for(Map.Entry<UUID,Integer> e:match.party.teams.entrySet()){
@@ -1072,7 +1292,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         }
         m.placedBlocks.clear();
         m.party.match=null;m.arena.busy=false;
-        m.arena.world().getWorldBorder().reset();
+        if(!m.arena.worldMode())m.arena.world().getWorldBorder().reset();
         cleanupDuelParty(m.party);
     }
     private Arena arenaForWorld(World world){
@@ -1202,7 +1422,9 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             }
             return;
         }
-        event.setRespawnLocation(Bukkit.getWorlds().get(0).getSpawnLocation());
+        Location spectatorSpawn=m.arena.worldMode()?m.worldSpawns.get(player.getUniqueId()):
+            (!m.arena.spawns.isEmpty()?m.arena.spawns.get(0):null);
+        event.setRespawnLocation(spectatorSpawn==null?Bukkit.getWorlds().get(0).getSpawnLocation():spectatorSpawn);
         Bukkit.getScheduler().runTaskLater(this,()->{
             if(playing.get(player.getUniqueId())==m && m.eliminated.contains(player.getUniqueId()))
                 player.setGameMode(GameMode.SPECTATOR);
@@ -1266,7 +1488,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         for(UUID u:m.party.teams.keySet()){
             Player p=Bukkit.getPlayer(u);
             if(p!=null){p.setGameMode(GameMode.ADVENTURE);p.setGravity(false);
-                p.teleport(m.arena.spawns.get(0));}
+                Location rest=m.arena.worldMode()?m.worldSpawns.get(u):m.arena.spawns.get(0);
+                if(rest!=null)p.teleport(rest); }
         }
         Bukkit.getScheduler().runTaskLater(this,()->{if(!m.ending)beginRound(m);},60L);
     }
@@ -1312,8 +1535,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         }
         m.party.match=null;
         cleanupDuelParty(m.party);
-        m.arena.world().getWorldBorder().reset();
-        resetArena(m.arena,()->{m.placedBlocks.clear();m.arena.busy=false;
+        if(!m.arena.worldMode())m.arena.world().getWorldBorder().reset();
+        resetArena(m.arena,m.placedBlocks,()->{m.placedBlocks.clear();m.arena.busy=false;
             getLogger().info("Arena "+m.arena.id+" reset after match.");});
     }
     private void reportCommand(Player p,String[] args){

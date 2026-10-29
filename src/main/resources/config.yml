@@ -1,9 +1,19 @@
 # Maximum blocks in an arena snapshot to prevent accidental huge saves.
 max-snapshot-blocks: 250000
-reset-blocks-per-tick: 1200
+# The new delta-reset restores only changed map blocks; raise cautiously if needed.
+reset-blocks-per-tick: 5000
 # A match arena world has its own worldborder. Shrinking starts after 8 minutes.
 border:
   enabled: true
   delay-seconds: 480
   shrink-seconds: 180
   final-size: 10
+
+# The special World arena requires no arena corners, spawns, or snapshot.
+# It chooses random safe ground in the existing overworld and does not restore the terrain.
+# WARNING: placed/broken/exploded blocks can persist there; shared overworld border is untouched.
+world-duels:
+  world: world
+  include-in-random: true
+  minimum-distance: 1200
+  maximum-distance: 4000

@@ -1,24 +1,56 @@
-# Eldritch Battles v0.2.2 — Health labels, axe shield stun, map protection
+# ELDRITCH BATTLES v0.2.5 (experimental Paper plugin)
 
-**Source-only experimental update for Paper 1.21.11 / Java 21.** You must build it with the repository GitHub Actions before putting the resulting `.jar` on the server. Keep a full backup first.
+A source update for **Paper 1.21.11**, Java 21. Builds a single JAR on GitHub Actions. This is NOT tested on a running Paper server and needs a successful GitHub Actions compilation before deployment.
 
-## Changes
+## New in v0.2.5
 
-- Removed the **Block Breaking** toggle from Duel Settings. In a live fight, the original arena is protected against normal player breaks and the explosion events handled by this plugin; players can break **blocks placed during the current round**, including shulker boxes. Player-placed blocks reset between rounds.
-- Health indicator now displays a constantly refreshed **numeric HP label with a red heart below the player nametag / above the player's head**. Minecraft counts **20 HP as 10 full hearts** (e.g. `20 ❤`), and updates every 5 ticks. Health display is visible to other players, not usually yourself. Requires the Duel Settings health toggle ON. This is server-side scoreboard UI: **no client mod or Skript needed**. Other scoreboard plugins can replace it, so temporarily disable competing nametag/scoreboard managers if necessary.
-- **Shield Stuns toggle now uses Paper's PlayerShieldDisableEvent.** With stun ON an enemy axe hit that naturally disables a blocking shield applies **100 ticks (5 seconds)** of cooldown; with OFF the shield-disable event is canceled for match player-versus-player. This is a shield disable, not player movement stun. Normal vanilla axe hit conditions still apply.
-- Builders with `eldritch.admin` in **Creative** mode can edit the arena outside fights.
-- Retains the v0.2.0 menus, parties, duel system, arena data and saved kits. No arena rebuild should be necessary.
+- **World arena option** in the arena picker. It selects random safe ground in the normal overworld, instead of using your saved castle arena. No pos1/pos2 or spawn markers needed for this special option. Each fight picks a random region, with teams/FFA distributed around that region.
+- **No regeneration for World fights.** World duels do **not** modify the overworld's shared world border. **WARNING: world terrain changes and placed blocks can remain**, unlike saved custom arenas. Test away from builds. Generated chunks may take a moment to load.
+- **Party leader head** on `/eb menu` opens a member-management GUI. Left-click other member = kick; right-click = transfer leader. Leader only, outside matches. The owner head itself is not kickable.
+- **Party visibility**: sign in `/eb menu` toggles public/private. A public party can be joined using `/party join <owner>` even without an invitation; private parties require one.
+- **Broadcast party** goat horn: broadcasts a pink message with a clickable green Join link, once every 30 seconds. Party must be public.
+- **Clickable party invitations** in chat rather than relying on players to type the command.
+- **Clickable direct duel requests** in chat with kit/mode, arena, number of rounds, Accept and Decline; **no request popup**. Existing `/duel PlayerName` or `/eb duel PlayerName` GUI lets the host choose the kit and arena first.
+- **More durable arena settings**: saves positions and spawn markers in both `arenas.yml` and `plugins/EldritchBattles/arena-anchors/<id>.yml`. If location objects fail to deserialize, attempts the backup; if corners are missing and a snapshot exists, tries recovering the bounds. Does not reconstruct a deleted or corrupted snapshot or missing world blocks.
+- **Faster custom-arena resetting**: instead of wiping the entire rectangular region to air and rebuilding it, it removes tracked player-placed blocks and restores baseline blocks only where they've changed. It still scans baseline blocks in batches; custom chests are compared too. Large arenas still need testing.
 
-## Install on your server
+## Commands
 
-1. **Back up the entire server** (especially `plugins/EldritchBattles/` and the arena world, e.g. `eldritch_test`).
-2. Extract the ZIP and upload the **contents** of the `eldritch-battles-v0.2.2` folder to the root of your existing GitHub repository, replacing existing paths. Do not put the folder itself inside the repository.
-3. Commit, check **Actions → Build Eldritch Battles** for a green build, and download the `EldritchBattles-JAR` artifact; extract `EldritchBattles-0.2.2.jar`.
-4. Stop MCServerHost. Delete **only** the old `EldritchBattles-*.jar` from `plugins/`, upload the new JAR, leave **all plugin data folders and world folders** alone, and restart.
-5. **Disable** `plugins/Skript/scripts/eldritch_no_break.sk` by renaming it to `eldritch_no_break.sk.disabled`, and restart or reload Skript; otherwise it will still prevent breaking player-placed shulkers.
-6. Test in a two-player duel: block an axe with a shield (stuns ON vs OFF), verify `20 ❤` under opponent's name at full health, place and mine a shulker, and try breaking the original floor. Test explosions on a **backup world**.
+| Command | Description |
+|---|---|
+| `/eb menu` or `/party` | Party home screen |
+| `/party create` | Start a party |
+| `/party invite <player>` | Invite player; clickable chat reply |
+| `/party join <owner>` | Join invited party or public party |
+| `/party open`, `/party close` | Make party public or private |
+| `/party broadcast` | Pink public invite with clickable join |
+| `/party kick <member>` | Remove member (owner only) |
+| `/party promote <member>` | Transfer ownership (owner only) |
+| `/party leave` | Leave/disband |
+| `/duel <player>` or `/eb duel <player>` | Direct 1v1 request with kit and arena selection |
+| `/eb arena list` | Show custom saved arenas plus special World option |
+| `/eb arena inspect <id>` | Diagnose missing corners, spawns, snapshot |
+| `/eb arena recover <id>` | Recover custom arena selection from existing snapshot |
+| `/eb arena pos1 <id>`, `pos2`, `spawn <id> 1`, `spawn <id> 2` | Setup a custom arena once if missing |
+| `/eb arena save <id>` | Save a custom arena snapshot |
+| `/eb kit save <id>`, `/eb kit icon <id> [material]` | Manage saved kits and menu icons |
 
-## Known limitations
+## Installation / migration
 
-This update has not yet been built against Paper or live-tested here. The Java syntax is checked, but the GitHub Gradle build is required. Plugin priority and other plugins (EpicDuels, Skript, WorldGuard, scoreboard/nametag plugins) can override protected actions, scoreboards, or shield behaviour. Protection covers normal break, explosion, burn and fade events in plugin-managed arena worlds. Physics changes, fluids, moving pistons, and plugins that change blocks without firing expected events can still affect map blocks: keep backups and test these mechanics before opening a public arena. Existing map structures outside the configured snapshot won't be reset automatically.
+1. **STOP SERVER, BACK UP EVERYTHING FIRST**, especially your arena world (`eldritch_test`) and `plugins/EldritchBattles/` folder. Changing plugin JARs must not delete these.
+2. Extract this ZIP. Upload the files **inside** `eldritch-battles-v0.2.5/` to the root of your existing GitHub repository, replacing existing source and workflow files (but not adding another nested folder).
+3. Commit. Go to **GitHub Actions → Build Eldritch Battles**. A *green* build should expose the `EldritchBattles-JAR` artifact. Download and extract it.
+4. Stop your MCServerHost Paper server. Replace the **old JAR only**, not the data folder, and restart.
+5. Check `/plugins`, `/eb arena list`, `/eb arena inspect test`, test a short 1v1 **with spare items and a backed-up world**.
+6. If `/duel` belongs to EpicDuels, use `/eb duel <player>` for this plugin. If `/party` is owned by another plugin, use `/eb party ...`.
+7. If the old version ALREADY lost the corners AND original snapshot is missing, **one-time** setup of pos1, pos2 and `/eb arena save test` is still required. v0.2.5 can't reconstruct deleted world data.
+8. Disable old `eldritch_no_break.sk` if it prevents breaking player-placed shulkers.
+
+## Important limitations
+
+- Only the server is authoritative for parties and games. Invitations, public status, active reports, and match state are in memory, not persistent after restart.
+- World duels use synchronously loaded/generated chunks. This can pause a busy server while locating safe ground. World matches are limited to one at a time; there is no per-player world border.
+- Safe-spawn checks are conservative but cannot guarantee every modded/custom terrain is harmless. Test in a copy of the world.
+- Faster snapshot resets restore baseline nonair blocks and tracked player placements; exotic fluid/redstone/physics or edits by other plugins can escape these protections.
+- Direct duel requests expire after 60 seconds. `/eb stop` remains a host-only termination, not a proper forfeit.
+- This version has not been compiled with the Paper dependency in this environment; GitHub Actions is the required compilation check. Share the first `error:` lines if it fails.
