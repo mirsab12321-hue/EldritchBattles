@@ -45,3 +45,8 @@
 - The arena's world border applies to **the whole arena world** while the match is active, not a separate border per player. Match reports and scoreboard health may interact with other scoreboard plugins.
 - Shield stuns are approximated using the shield cooldown API; PvP plugins or mods may override behavior.
 - PvP placement and breaking may still be blocked by other protection plugins/Skripts.
+
+
+### Compilation hotfix (2026-10-29)
+
+Added the missing `net.kyori.adventure.text.format.NamedTextColor` import referenced by the scoreboard and match report features. This source-only fix has not been fully compiled against Paper here; verify via GitHub Actions.
