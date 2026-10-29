@@ -1,5 +1,5 @@
 name: EldritchBattles
-version: '0.2.0'
+version: '0.2.2'
 main: dev.eldritch.battles.EldritchBattles
 api-version: '1.21.11'
 author: Eldritch Champions

@@ -11,6 +11,12 @@ import org.bukkit.command.TabCompleter;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.block.BlockBurnEvent;
+import org.bukkit.event.block.BlockFadeEvent;
+import org.bukkit.event.block.BlockExplodeEvent;
+import org.bukkit.event.entity.EntityExplodeEvent;
+import org.bukkit.event.EventPriority;
+import io.papermc.paper.event.player.PlayerShieldDisableEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityRegainHealthEvent;
 import org.bukkit.event.entity.EntityResurrectEvent;
@@ -72,7 +78,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         final UUID owner;
         final LinkedHashMap<UUID, Integer> teams = new LinkedHashMap<>();
         boolean ffa = false, friendlyFire = false, drops = false, border = true;
-        boolean healthIndicator = true, shieldStuns = true, allowBreaking = false, infiniteRounds = false;
+        boolean healthIndicator = true, shieldStuns = true, infiniteRounds = false;
         boolean directDuel = false;
         int bestOf = 3; // Count of rounds, NOT best-of series. Saved field name retained for compatibility.
         String kit, arena;
@@ -108,6 +114,10 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             && l.getBlockX()>=minX() && l.getBlockX()<=maxX() && l.getBlockY()>=minY() && l.getBlockY()<=maxY()
             && l.getBlockZ()>=minZ() && l.getBlockZ()<=maxZ();}
     }
+    /** World is implicit: each arena has its own dedicated builder/duel world. */
+    record BlockKey(int x, int y, int z) {
+        static BlockKey of(Block block){return new BlockKey(block.getX(),block.getY(),block.getZ());}
+    }
     static class BlockRecord {
         final int x,y,z;
         final String data;
@@ -135,6 +145,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         final Map<UUID,Kit> lastInventories=new HashMap<>();
         final Map<UUID,Integer> deaths=new HashMap<>(), kills=new HashMap<>();
         final List<BukkitTask> tasks = new ArrayList<>();
+        // Only blocks placed while this match is active may be mined/exploded in this arena world.
+        final Set<BlockKey> placedBlocks = new HashSet<>();
         Scoreboard healthBoard;
         int round=0; boolean ending=false, transitioning=true;
         Match(Party p,Arena a,Kit k){party=p;arena=a;kit=k;}
@@ -181,7 +193,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         // Restore a sane border after an interrupted match/restart in a plugin-owned arena world.
         for(Arena arena:arenas.values())if(arena.world()!=null)arena.world().getWorldBorder().reset();
         getServer().getPluginManager().registerEvents(this,this);
-        getLogger().info("Eldritch Battles v0.2.0 enabled. Use /eb help");
+        getLogger().info("Eldritch Battles v0.2.2 enabled. Use /eb help");
     }
     @Override public void onDisable(){
         for(Match match: new HashSet<>(playing.values())){
@@ -190,6 +202,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
                 if(p!=null && !p.isDead()) restore(p,b);
             }
             for(BukkitTask t:match.tasks)t.cancel();
+            match.placedBlocks.clear();
             match.arena.busy=false;
         }
         saveArenas();
@@ -721,7 +734,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             action(menu,13,"arenaMenu",button(Material.GRASS_BLOCK,"&eArena: "+(party.arena==null?"RANDOM":party.arena),
                 "&7Choose random or select an arena"));
             action(menu,16,"duelSettings",button(Material.IRON_BARS,"&6Duel Settings",
-                "&7Health, shield stuns, blocks, friendly fire","&7Drops and shrinking border"));
+                "&7Health, shield stuns, friendly fire","&7Drops and shrinking border"));
             action(menu,45,"kits",button(Material.BARRIER,"&cBack to Kits"));
             action(menu,53,"start",button(Material.LIME_CONCRETE,"&aSTART MATCH",
                 party.directDuel?"&7Send duel request to opponent":"&7Teleport everyone into arena",
@@ -740,11 +753,9 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             action(menu,45,"settings",button(Material.BARRIER,"&cBack to Settings"));
         }else if(page.equals("duelSettings")){
             action(menu,10,"health",button(Material.GOLDEN_APPLE,"&6Health Indicator: "+onOff(party.healthIndicator),
-                "&7Show health below player names"));
+                "&7Show 20 ❤ (10 hearts) above players' heads", "&7Visible beneath each player's nametag"));
             action(menu,11,"shield",button(Material.SHIELD,"&eShield Stuns: "+onOff(party.shieldStuns),
-                "&7Axes disable blocking shields"));
-            action(menu,12,"breaking",button(Material.IRON_PICKAXE,"&eBlock Breaking: "+onOff(party.allowBreaking),
-                "&7If OFF, players can place but cannot break"));
+                "&7Axes disable blocking shields for 5 seconds"));
             action(menu,13,"friendly",button(Material.DIAMOND_SWORD,"&eFriendly Fire: "+onOff(party.friendlyFire)));
             action(menu,14,"drops",button(Material.HOPPER,"&eDeath Drops: "+onOff(party.drops)));
             action(menu,15,"border",button(Material.TNT,"&eShrinking Border: "+onOff(party.border),
@@ -801,7 +812,6 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             }
             case "health" -> party.healthIndicator=!party.healthIndicator;
             case "shield" -> party.shieldStuns=!party.shieldStuns;
-            case "breaking" -> party.allowBreaking=!party.allowBreaking;
             case "friendly" -> party.friendlyFire=!party.friendlyFire;
             case "drops" -> party.drops=!party.drops;
             case "border" -> party.border=!party.border;
@@ -891,6 +901,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         resetArena(m.arena,()->{
             if(m.ending)return;
             m.round++;m.eliminated.clear();m.lastInventories.clear();
+            m.placedBlocks.clear(); // Reset has removed all placed blocks from the previous round.
             Map<UUID,Location> positions=chooseRoundSpawns(m);
             if(positions==null){
                 partyMsg(m.party,"&cCannot find enough safe spawn locations inside the saved arena."
@@ -951,14 +962,29 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         if(!match.party.healthIndicator)return;
         ScoreboardManager sm=Bukkit.getScoreboardManager();
         if(sm==null)return;
-        Scoreboard board=sm.getNewScoreboard();
         try{
-            Objective health=board.registerNewObjective("eb_health",Criteria.HEALTH,Component.text("❤",NamedTextColor.RED));
+            Scoreboard board=sm.getNewScoreboard();
+            // Explicitly managed scores avoid the vanilla HEALTH criterion initialization issue.
+            Objective health=board.registerNewObjective("eb_health",Criteria.DUMMY,
+                Component.text("❤",NamedTextColor.RED));
             health.setDisplaySlot(DisplaySlot.BELOW_NAME);
             match.healthBoard=board;
-            for(UUID u:match.party.teams.keySet()){
-                Player p=Bukkit.getPlayer(u);if(p!=null)p.setScoreboard(board);
-            }
+            // Update after health changes and keep the board active if another plugin replaces it.
+            BukkitTask updater=new BukkitRunnable(){
+                @Override public void run(){
+                    if(match.ending || match.healthBoard!=board){cancel();return;}
+                    for(UUID u:match.party.teams.keySet()){
+                        Player participant=Bukkit.getPlayer(u);
+                        if(participant==null || !participant.isOnline())continue;
+                        // Minecraft health uses 2 HP per heart: 20 HP = 10 full hearts.
+                        // Only the numeric HP is shown in the overhead BELOW_NAME label.
+                        int hp=(int)Math.ceil(Math.max(0,participant.getHealth()));
+                        health.getScore(participant.getName()).setScore(hp);
+                        if(participant.getScoreboard()!=board)participant.setScoreboard(board);
+                    }
+                }
+            }.runTaskTimer(this,0L,5L);
+            match.tasks.add(updater);
         }catch(Exception ex){getLogger().warning("Could not display health indicator: "+ex.getMessage());}
     }
     /** Only choose level, solid, non-hazardous floor with space for the player and their head. */
@@ -1044,17 +1070,77 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             Player p=Bukkit.getPlayer(u);PlayerBackup b=m.backups.get(u);
             if(p!=null && b!=null && !p.isDead()){p.setGravity(true);restore(p,b);}
         }
+        m.placedBlocks.clear();
         m.party.match=null;m.arena.busy=false;
         m.arena.world().getWorldBorder().reset();
         cleanupDuelParty(m.party);
     }
+    private Arena arenaForWorld(World world){
+        for(Arena arena:arenas.values())if(arena.worldName.equals(world.getName()))return arena;
+        return null;
+    }
+    private boolean canEditArenaOutsideMatch(Player player,Arena arena){
+        // Builders can still edit the original map in Creative mode while no fight is running.
+        return !arena.busy && player.getGameMode()==GameMode.CREATIVE
+            && player.hasPermission("eldritch.admin");
+    }
     @EventHandler public void onBreak(BlockBreakEvent event){
+        Arena arena=arenaForWorld(event.getBlock().getWorld());
+        if(arena==null)return;
+        Match match=playing.get(event.getPlayer().getUniqueId());
+        if(match!=null && match.arena==arena && !match.ending && !match.transitioning
+            && match.placedBlocks.contains(BlockKey.of(event.getBlock())))return;
+        if(match==null && canEditArenaOutsideMatch(event.getPlayer(),arena))return;
+        // Everything else is part of the protected map, including towers outside the snapshot cuboid.
+        event.setCancelled(true);
+    }
+    @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
+    public void afterBreak(BlockBreakEvent event){
         Match m=playing.get(event.getPlayer().getUniqueId());
-        if(m!=null && (m.ending || m.transitioning || !m.party.allowBreaking))event.setCancelled(true);
+        if(m!=null && m.arena.world()==event.getBlock().getWorld())
+            m.placedBlocks.remove(BlockKey.of(event.getBlock()));
     }
     @EventHandler public void onPlace(BlockPlaceEvent event){
         Match m=playing.get(event.getPlayer().getUniqueId());
-        if(m!=null && (m.ending || m.transitioning))event.setCancelled(true);
+        if(m!=null && (m.ending || m.transitioning || !m.arena.inside(event.getBlockPlaced().getLocation())))
+            event.setCancelled(true);
+    }
+    @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
+    public void afterPlace(BlockPlaceEvent event){
+        Match m=playing.get(event.getPlayer().getUniqueId());
+        if(m!=null && !m.ending && !m.transitioning && m.arena.inside(event.getBlockPlaced().getLocation()))
+            m.placedBlocks.add(BlockKey.of(event.getBlockPlaced()));
+    }
+    private void protectMapFromExplosion(World world,List<Block> blocks){
+        Arena arena=arenaForWorld(world);
+        if(arena==null)return;
+        Match match=arenaMatch(arena);
+        blocks.removeIf(block->match==null || !match.placedBlocks.contains(BlockKey.of(block)));
+        // A destroyed placed block must no longer be considered breakable after an explosion.
+        if(match!=null)for(Block block:blocks)match.placedBlocks.remove(BlockKey.of(block));
+    }
+    private Match arenaMatch(Arena arena){
+        for(Match match:playing.values())if(match.arena==arena && !match.ending && !match.transitioning)
+            return match;
+        return null;
+    }
+    @EventHandler public void onEntityExplode(EntityExplodeEvent event){
+        protectMapFromExplosion(event.getLocation().getWorld(),event.blockList());
+    }
+    @EventHandler public void onBlockExplode(BlockExplodeEvent event){
+        protectMapFromExplosion(event.getBlock().getWorld(),event.blockList());
+    }
+    @EventHandler public void onBlockBurn(BlockBurnEvent event){
+        Arena arena=arenaForWorld(event.getBlock().getWorld());
+        if(arena==null)return;
+        Match match=arenaMatch(arena);
+        if(match==null || !match.placedBlocks.contains(BlockKey.of(event.getBlock())))event.setCancelled(true);
+    }
+    @EventHandler public void onBlockFade(BlockFadeEvent event){
+        Arena arena=arenaForWorld(event.getBlock().getWorld());
+        if(arena==null)return;
+        Match match=arenaMatch(arena);
+        if(match==null || !match.placedBlocks.contains(BlockKey.of(event.getBlock())))event.setCancelled(true);
     }
     @EventHandler public void onAnyDamage(EntityDamageEvent event){
         if(!(event.getEntity() instanceof Player p))return;
@@ -1072,16 +1158,24 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             && m.side(attacker.getUniqueId()).equals(m.side(hurt.getUniqueId()))&&!m.party.friendlyFire){
             event.setCancelled(true);return;
         }
-        if(attacker!=null && hurt.isBlocking()){
-            String weapon=attacker.getInventory().getItemInMainHand().getType().name();
-            if(weapon.endsWith("_AXE") && !weapon.equals("PICKAXE")){
-                // Applying or cancelling a cooldown adjusts shield stuns without changing kit equipment.
-                if(m.party.shieldStuns)hurt.setCooldown(Material.SHIELD,100);
-                else Bukkit.getScheduler().runTask(this,()->{
-                    if(playing.get(hurt.getUniqueId())==m)hurt.setCooldown(Material.SHIELD,0);
-                });
-            }
+    }
+    /** Paper exposes the shield-disable event before the game applies the cooldown.
+     * Updating that event fixes a race where setCooldown() in damage handlers was overwritten. */
+    @EventHandler(priority=EventPriority.HIGHEST, ignoreCancelled=true)
+    public void onShieldDisable(PlayerShieldDisableEvent event){
+        Player defender=event.getPlayer();
+        Match match=playing.get(defender.getUniqueId());
+        if(match==null || match.ending || match.transitioning)return;
+        if(!(event.getDamager() instanceof Player attacker))return;
+        if(playing.get(attacker.getUniqueId())!=match)return;
+        if(!match.party.ffa && match.side(attacker.getUniqueId()).equals(match.side(defender.getUniqueId()))
+            && !match.party.friendlyFire){
+            event.setCancelled(true);
+            return;
         }
+        // 100 ticks = 5 seconds. When disabled, axe hits cannot stun match participants.
+        if(match.party.shieldStuns)event.setCooldown(100);
+        else event.setCancelled(true);
     }
     private Kit currentKit(Player p){return new Kit(p.getInventory().getStorageContents(),
         p.getInventory().getArmorContents(),p.getInventory().getItemInOffHand());}
@@ -1219,7 +1313,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         m.party.match=null;
         cleanupDuelParty(m.party);
         m.arena.world().getWorldBorder().reset();
-        resetArena(m.arena,()->{m.arena.busy=false;getLogger().info("Arena "+m.arena.id+" reset after match.");});
+        resetArena(m.arena,()->{m.placedBlocks.clear();m.arena.busy=false;
+            getLogger().info("Arena "+m.arena.id+" reset after match.");});
     }
     private void reportCommand(Player p,String[] args){
         if(args.length<2){msg(p,"&cClick a username in a recent match report to inspect their items.");return;}
