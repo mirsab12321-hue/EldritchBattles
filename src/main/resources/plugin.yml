@@ -1,5 +1,5 @@
 name: EldritchBattles
-version: '0.2.5'
+version: '0.2.6'
 main: dev.eldritch.battles.EldritchBattles
 api-version: '1.21.11'
 author: Eldritch Champions
@@ -12,6 +12,9 @@ commands:
   duel:
     description: Challenge another player to a direct 1v1 duel
     usage: /duel <player> (or /eb duel <player>)
+  editkit:
+    description: Arrange your own kit inventory and hotbar without changing anyone else's kit layout
+    usage: /editkit <kit>
   party:
     description: Manage Eldritch parties
     usage: /party create|invite|join|open|close|broadcast|kick|promote|leave (or /eb party ...)

@@ -66,14 +66,16 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     private final Map<String, Arena> arenas = new LinkedHashMap<>();
     private final Map<String, Kit> kits = new LinkedHashMap<>();
     private final Map<String, Material> kitIcons = new HashMap<>();
+    // A 36-slot permutation for each player + kit. No kit items are copied into this file.
+    private final Map<UUID, Map<String, int[]>> personalLayouts = new HashMap<>();
     private final Map<UUID, UUID> invitations = new HashMap<>();
     private final Map<UUID, Long> lastBroadcast = new HashMap<>();
     private Arena worldArena;
     private final Map<UUID, Party> duelRequests = new HashMap<>();
     private final Map<UUID, UUID> duelTargets = new HashMap<>();
     private final LinkedHashMap<String, MatchReport> reports = new LinkedHashMap<>();
-    private File arenaFile, kitsFile, recoveryFile;
-    private YamlConfiguration arenaYaml, kitsYaml, recoveryYaml;
+    private File arenaFile, kitsFile, recoveryFile, layoutsFile;
+    private YamlConfiguration arenaYaml, kitsYaml, recoveryYaml, layoutsYaml;
     private final String prefix = ChatColor.GOLD + "[Eldritch] " + ChatColor.RESET;
 
     static class Party {
@@ -179,6 +181,18 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         Menu(String page, Party party){this.page=page;this.party=party;}
         public Inventory getInventory(){return inventory;}
     }
+    /** A private, read-only preview of a shared kit, reordered with each player's own slot map. */
+    static class KitLayoutMenu implements InventoryHolder {
+        final UUID playerId;
+        final String kitId;
+        final int[] order;
+        int selected = -1;
+        Inventory inventory;
+        KitLayoutMenu(UUID playerId, String kitId, int[] order) {
+            this.playerId = playerId; this.kitId = kitId; this.order = order.clone();
+        }
+        @Override public Inventory getInventory() { return inventory; }
+    }
     static ItemStack[] cloneItems(ItemStack[] src) {
         if(src==null) return new ItemStack[0];
         ItemStack[] ret=new ItemStack[src.length];
@@ -190,15 +204,17 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         arenaFile=new File(getDataFolder(),"arenas.yml");
         kitsFile=new File(getDataFolder(),"kits.yml");
         recoveryFile=new File(getDataFolder(),"recover-inventory.yml");
+        layoutsFile=new File(getDataFolder(),"kit-layouts.yml");
         arenaYaml=YamlConfiguration.loadConfiguration(arenaFile);
         kitsYaml=YamlConfiguration.loadConfiguration(kitsFile);
         recoveryYaml=YamlConfiguration.loadConfiguration(recoveryFile);
-        loadKits(); loadArenas();
+        layoutsYaml=YamlConfiguration.loadConfiguration(layoutsFile);
+        loadKits(); loadPersonalLayouts(); loadArenas();
         worldArena=new Arena("world",getConfig().getString("world-duels.world","world"));
         // Restore a sane border after an interrupted match/restart in a plugin-owned arena world.
         for(Arena arena:arenas.values())if(!arena.worldMode() && arena.world()!=null)arena.world().getWorldBorder().reset();
         getServer().getPluginManager().registerEvents(this,this);
-        getLogger().info("Eldritch Battles v0.2.5 enabled. Use /eb help");
+        getLogger().info("Eldritch Battles v0.2.6 enabled. Use /eb help");
     }
     @Override public void onDisable(){
         for(Match match: new HashSet<>(playing.values())){
@@ -211,6 +227,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             match.arena.busy=false;
         }
         saveArenas();
+        savePersonalLayouts();
     }
     private void msg(CommandSender p,String s){p.sendMessage(prefix+ChatColor.translateAlternateColorCodes('&',s));}
     private void partyMsg(Party party,String s){for(UUID u:party.teams.keySet()){
@@ -223,13 +240,20 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         msg(p,"&6/party open | close | broadcast | kick <player> | promote <player>");
         msg(p,"&e/eb menu &7(party home / team battles)");
         msg(p,"&e/eb stop &7(end your infinite-round match)");
+        msg(p,"&e/eb kit edit <name> &7(personal inventory/hotbar layout)");
+        msg(p,"&e/editkit <name> &7(shortcut for your own layout)");
         msg(p,"&e/eb kit save|icon|list|delete <name> &7(admin)");
-        msg(p,"&e/eb arena create|edit|pos1|pos2|spawn|save|list|inspect|recover &7(admin)");
+        msg(p,"&e/eb arena create|edit|pos1|pos2|spawn|save|reset|list|inspect|recover &7(admin)");
     }
     @Override public boolean onCommand(CommandSender sender,Command command,String label,String[] args){
         if(!(sender instanceof Player p)){msg(sender,"Players must use this command in game.");return true;}
         try {
             if(command.getName().equalsIgnoreCase("duel")){duelCommand(p,args);return true;}
+            if(command.getName().equalsIgnoreCase("editkit")){
+                if(args.length==0)msg(p,"&eUsage: /editkit <kit>");
+                else kitCommand(p,new String[]{"edit",args[0]});
+                return true;
+            }
             if(command.getName().equalsIgnoreCase("party")){partyCommand(p,args);return true;}
             if(args.length==0 || args[0].equalsIgnoreCase("help")){help(p);return true;}
             switch(args[0].toLowerCase(Locale.ROOT)) {
@@ -252,7 +276,9 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     @Override public List<String> onTabComplete(CommandSender sender,Command cmd,String alias,String[] a){
         List<String> values=new ArrayList<>();
         String root=cmd.getName().toLowerCase(Locale.ROOT);
-        if(root.equals("duel")){
+        if(root.equals("editkit")){
+            if(a.length==1)values.addAll(kits.keySet());
+        }else if(root.equals("duel")){
             if(a.length==1){values.addAll(List.of("accept","deny","cancel"));for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());}
             else if(a.length==2 && (a[0].equalsIgnoreCase("accept")||a[0].equalsIgnoreCase("deny")))
                 for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());
@@ -265,8 +291,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             switch(a[0].toLowerCase(Locale.ROOT)){
                 case "duel" -> {values.addAll(List.of("accept","deny","cancel"));for(Player p:Bukkit.getOnlinePlayers())values.add(p.getName());}
                 case "party" -> values.addAll(List.of("create","invite","join","leave","disband","list","menu","open","close","broadcast","kick","promote"));
-                case "kit" -> values.addAll(List.of("save","list","delete","icon"));
-                case "arena" -> values.addAll(List.of("create","edit","pos1","pos2","spawn","save","list","inspect","recover"));
+                case "kit" -> values.addAll(List.of("save","list","delete","icon","edit"));
+                case "arena" -> values.addAll(List.of("create","edit","pos1","pos2","spawn","save","reset","list","inspect","recover"));
             }
         }else if(a.length==3){
             if(a[0].equalsIgnoreCase("kit"))values.addAll(kits.keySet());
@@ -460,7 +486,14 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     }
     private boolean isLeader(Player p,Party party){return party!=null&&party.owner.equals(p.getUniqueId());}
     private void kitCommand(Player p,String[] a){
-        if(a.length==0){msg(p,"&e/eb kit save <name> | list | delete <name> | icon <name> [item]");return;}
+        if(a.length==0){msg(p,"&e/eb kit edit <name> | list | save <name> | delete <name> | icon <name> [item]");return;}
+        if(a[0].equalsIgnoreCase("edit")){
+            if(a.length<2){msg(p,"&eUsage: /eb kit edit <kit> (or /editkit <kit>)");return;}
+            String id=validId(a[1]);
+            if(id==null || !kits.containsKey(id)){msg(p,"&cUnknown saved kit. /eb kit list");return;}
+            if(playing.containsKey(p.getUniqueId())){msg(p,"&cYou cannot edit kit layouts during a match.");return;}
+            openKitLayoutEditor(p,id);return;
+        }
         if(a[0].equalsIgnoreCase("list")){msg(p,"&eSaved kits: "+String.join(", ",kits.keySet()));return;}
         if(!admin(p))return;
         if(a.length<2){msg(p,"&cSpecify kit name, e.g. /eb kit save sword");return;}
@@ -488,8 +521,129 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             saveKits();
             msg(p,"&aSet the '&f"+id+"&a' menu icon to &f"+material.name()+"&a. Reopen /eb menu to see it.");
         }else if(a[0].equalsIgnoreCase("delete")){
-            kits.remove(id);kitIcons.remove(id);saveKits();msg(p,"&eKit deleted.");
+            kits.remove(id);kitIcons.remove(id);
+            for(Map<String,int[]> layouts:personalLayouts.values())layouts.remove(id);
+            saveKits();savePersonalLayouts();msg(p,"&eKit deleted.");
         }else msg(p,"&cUnknown kit command.");
+    }
+    private static int[] defaultLayout() {
+        int[] layout=new int[36];for(int i=0;i<layout.length;i++)layout[i]=i;
+        return layout;
+    }
+    private static boolean validLayout(int[] order) {
+        if(order==null || order.length!=36)return false;
+        boolean[] seen=new boolean[36];
+        for(int n:order){if(n<0 || n>=36 || seen[n])return false;seen[n]=true;}
+        return true;
+    }
+    private int[] layoutFor(UUID uuid,String kitId) {
+        int[] saved=personalLayouts.getOrDefault(uuid,Collections.emptyMap()).get(kitId);
+        return validLayout(saved)?saved.clone():defaultLayout();
+    }
+    private void loadPersonalLayouts() {
+        personalLayouts.clear();
+        if(layoutsYaml.getConfigurationSection("players")==null)return;
+        for(String id:layoutsYaml.getConfigurationSection("players").getKeys(false)){
+            UUID uuid;
+            try{uuid=UUID.fromString(id);}catch(IllegalArgumentException ex){continue;}
+            if(layoutsYaml.getConfigurationSection("players."+id)==null)continue;
+            Map<String,int[]> perKit=new HashMap<>();
+            for(String kit:layoutsYaml.getConfigurationSection("players."+id).getKeys(false)){
+                List<Integer> values=layoutsYaml.getIntegerList("players."+id+"."+kit);
+                int[] order=values.stream().mapToInt(Integer::intValue).toArray();
+                if(validLayout(order))perKit.put(kit,order);
+            }
+            if(!perKit.isEmpty())personalLayouts.put(uuid,perKit);
+        }
+    }
+    private void savePersonalLayouts() {
+        YamlConfiguration fresh=new YamlConfiguration();
+        for(var player:personalLayouts.entrySet())for(var kit:player.getValue().entrySet()){
+            if(!validLayout(kit.getValue()))continue;
+            // Ignore default identity mappings so they never bloat this data file.
+            if(Arrays.equals(kit.getValue(),defaultLayout()))continue;
+            List<Integer> order=new ArrayList<>(36);
+            for(int slot:kit.getValue())order.add(slot);
+            fresh.set("players."+player.getKey()+"."+kit.getKey(),order);
+        }
+        try{fresh.save(layoutsFile);layoutsYaml=fresh;}
+        catch(IOException ex){getLogger().severe("Could not save kit-layouts.yml: "+ex.getMessage());}
+    }
+    private ItemStack[] personalStorage(UUID uuid,String kitId,Kit template) {
+        int[] positions=layoutFor(uuid,kitId);
+        ItemStack[] result=new ItemStack[Math.max(36,template.storage.length)];
+        for(int dest=0;dest<36;dest++){
+            int src=positions[dest];
+            if(src<template.storage.length && template.storage[src]!=null)
+                result[dest]=template.storage[src].clone();
+        }
+        // Preserve any future extra storage slots if the server provides them.
+        for(int i=36;i<template.storage.length;i++)
+            result[i]=template.storage[i]==null?null:template.storage[i].clone();
+        return result;
+    }
+    private int kitSlotForMenu(int clicked) {
+        if(clicked>=0 && clicked<27)return clicked+9; // Main inventory (3 rows)
+        if(clicked>=36 && clicked<45)return clicked-36; // Hotbar (9 slots)
+        return -1;
+    }
+    private void openKitLayoutEditor(Player p,String kitId) {
+        KitLayoutMenu editor=new KitLayoutMenu(p.getUniqueId(),kitId,layoutFor(p.getUniqueId(),kitId));
+        editor.inventory=Bukkit.createInventory(editor,54,"Edit YOUR "+kitId+" layout");
+        paintKitLayoutEditor(editor);
+        p.openInventory(editor.inventory);
+        msg(p,"&eClick one item slot, then another to swap them. &aClick SAVE to keep your personal layout.");
+    }
+    private void paintKitLayoutEditor(KitLayoutMenu editor) {
+        Inventory gui=editor.inventory;
+        Kit template=kits.get(editor.kitId);if(template==null)return;
+        for(int slot=0;slot<54;slot++)gui.setItem(slot,null);
+        for(int dest=0;dest<36;dest++){
+            int source=editor.order[dest];
+            ItemStack item=source<template.storage.length?template.storage[source]:null;
+            int guiSlot=dest<9?dest+36:dest-9;
+            // Empty slots can be selected and swapped too; no actual item is ever removed.
+            gui.setItem(guiSlot,item==null || item.getType().isAir()
+                ?button(Material.LIGHT_GRAY_STAINED_GLASS_PANE,"&7Empty Slot "+(dest+1),"&eClick to swap")
+                :item.clone());
+        }
+        for(int slot=27;slot<=35;slot++)
+            gui.setItem(slot,button(Material.BLACK_STAINED_GLASS_PANE," "));
+        gui.setItem(31,button(Material.BOOK,"&6HOTBAR BELOW ↓",
+            "&7Top 3 rows: inventory","&7Bottom item row: hotbar slots 1-9",
+            "&eClick two slots to swap items"));
+        for(int slot=45;slot<=53;slot++)gui.setItem(slot,button(Material.GRAY_STAINED_GLASS_PANE," "));
+        gui.setItem(45,button(Material.LIME_CONCRETE,"&aSAVE PERSONAL LAYOUT",
+            "&7Only changes YOUR arrangement for "+editor.kitId));
+        gui.setItem(49,button(Material.REDSTONE_BLOCK,"&eRESET TO KIT DEFAULT",
+            "&7Preview the kit creator's original slot order","&7Click SAVE to keep the reset"));
+        gui.setItem(53,button(Material.BARRIER,"&cCANCEL","&7Closes without saving changes"));
+    }
+    private void clickKitLayoutEditor(InventoryClickEvent event,Player p,KitLayoutMenu editor) {
+        event.setCancelled(true);
+        if(!p.getUniqueId().equals(editor.playerId)){p.closeInventory();return;}
+        if(event.getClickedInventory()!=editor.inventory)return;
+        int slot=event.getRawSlot();
+        if(slot==45){
+            if(Arrays.equals(editor.order,defaultLayout())){
+                Map<String,int[]> map=personalLayouts.get(p.getUniqueId());
+                if(map!=null){map.remove(editor.kitId);if(map.isEmpty())personalLayouts.remove(p.getUniqueId());}
+            }else personalLayouts.computeIfAbsent(p.getUniqueId(),ignored->new HashMap<>())
+                .put(editor.kitId,editor.order.clone());
+            savePersonalLayouts();p.closeInventory();
+            msg(p,"&aSaved your personal &f"+editor.kitId+"&a inventory/hotbar layout. Other players are unaffected.");
+            return;
+        }
+        if(slot==49){editor.selected=-1;System.arraycopy(defaultLayout(),0,editor.order,0,36);
+            paintKitLayoutEditor(editor);msg(p,"&eShowing default slots. Click SAVE to apply.");return;}
+        if(slot==53){p.closeInventory();msg(p,"&7Layout edit cancelled.");return;}
+        int position=kitSlotForMenu(slot);if(position<0)return;
+        if(editor.selected==-1){editor.selected=position;
+            msg(p,"&eSelected "+(position<9?"hotbar "+(position+1):"inventory "+(position-8))+
+                ". Click another slot to swap.");return;}
+        int first=editor.selected;editor.selected=-1;
+        int old=editor.order[first];editor.order[first]=editor.order[position];editor.order[position]=old;
+        paintKitLayoutEditor(editor);
     }
     private String validId(String id){id=id.toLowerCase(Locale.ROOT);return id.matches("[a-z0-9_-]{1,24}")?id:null;}
     private ChunkGenerator voidGenerator(){
@@ -508,7 +662,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     }
     private void arenaCommand(Player p,String[] a){
         if(!admin(p))return;
-        if(a.length==0){msg(p,"&e/eb arena create|edit|pos1|pos2|spawn|save|list");return;}
+        if(a.length==0){msg(p,"&e/eb arena create|edit|pos1|pos2|spawn|save|reset|list");return;}
         if(a[0].equalsIgnoreCase("list")){
             for(Arena arena:arenas.values())msg(p,"&e"+arena.id+" &7world="+arena.worldName+" ready="+arena.ready()+" spawns="+arena.spawns.size());
             if(worldArena!=null)msg(p,"&eWorld &7normal world="+worldArena.worldName+" available="+worldArena.ready()+" (no snapshot required)");
@@ -533,6 +687,18 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         Arena ar=arenas.get(id);if(ar==null){msg(p,"&cUnknown arena. /eb arena list");return;}
         if(ar.busy){msg(p,"&cWait until the arena fight/reset is finished.");return;}
         switch(a[0].toLowerCase(Locale.ROOT)){
+            case "reset" -> {
+                if(ar.baseline==null || ar.first==null || ar.second==null || ar.world()==null){
+                    msg(p,"&cMissing snapshot/corners. Inspect: /eb arena inspect "+id);return;
+                }
+                // Reset applies to saved custom arenas only; never to the random-coordinate world.
+                ar.busy=true;
+                msg(p,"&eRestoring saved arena "+id+". Do not edit it until completion.");
+                resetArena(ar,Collections.emptySet(),()->{
+                    ar.busy=false;
+                    msg(p,"&aSaved arena "+id+" restored from its snapshot.");
+                });
+            }
             case "inspect" -> {
                 msg(p,"&6Arena "+ar.id+": world="+ar.worldName+", loaded="+(ar.world()!=null));
                 msg(p,"&7pos1="+(ar.first==null?"MISSING":ar.first.toVector())+" pos2="+(ar.second==null?"MISSING":ar.second.toVector()));
@@ -916,6 +1082,9 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
     @EventHandler public void inventoryClick(InventoryClickEvent event){
         if(!(event.getWhoClicked() instanceof Player p))return;
         Inventory top=event.getView().getTopInventory();
+        if(top.getHolder() instanceof KitLayoutMenu editor){
+            clickKitLayoutEditor(event,p,editor);return;
+        }
         if(!(top.getHolder() instanceof Menu menu))return;
         event.setCancelled(true);
         if(event.getClickedInventory()!=top)return;
@@ -989,7 +1158,8 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
         Bukkit.getScheduler().runTask(this,()->{if(p.isOnline())openMenu(p,destination);});
     }
     @EventHandler public void inventoryDrag(InventoryDragEvent event){
-        if(event.getView().getTopInventory().getHolder() instanceof Menu)event.setCancelled(true);
+        InventoryHolder holder=event.getView().getTopInventory().getHolder();
+        if(holder instanceof Menu || holder instanceof KitLayoutMenu)event.setCancelled(true);
     }
     private Arena resolveArena(Party party){
         if(party.arena!=null){
@@ -1131,7 +1301,7 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
                 Player p=Bukkit.getPlayer(uuid);
                 if(p==null){m.eliminated.add(uuid);continue;}
                 PlayerInventory inv=p.getInventory();inv.clear();
-                inv.setStorageContents(cloneItems(m.kit.storage));
+                inv.setStorageContents(personalStorage(uuid,m.party.kit,m.kit));
                 inv.setArmorContents(cloneItems(m.kit.armor));
                 inv.setItemInOffHand(m.kit.offhand==null?new ItemStack(Material.AIR):m.kit.offhand.clone());
                 p.setGameMode(GameMode.SURVIVAL);p.setFoodLevel(20);p.setSaturation(20);
@@ -1290,10 +1460,14 @@ public final class EldritchBattles extends JavaPlugin implements Listener, TabCo
             Player p=Bukkit.getPlayer(u);PlayerBackup b=m.backups.get(u);
             if(p!=null && b!=null && !p.isDead()){p.setGravity(true);restore(p,b);}
         }
-        m.placedBlocks.clear();
-        m.party.match=null;m.arena.busy=false;
-        if(!m.arena.worldMode())m.arena.world().getWorldBorder().reset();
+        m.party.match=null;
+        if(!m.arena.worldMode() && m.arena.world()!=null)m.arena.world().getWorldBorder().reset();
         cleanupDuelParty(m.party);
+        // Aborted fights must also regenerate all saved arenas; World mode skips this.
+        resetArena(m.arena,m.placedBlocks,()->{
+            m.placedBlocks.clear();m.arena.busy=false;
+            getLogger().info("Arena "+m.arena.id+" restored after aborted match.");
+        });
     }
     private Arena arenaForWorld(World world){
         for(Arena arena:arenas.values())if(arena.worldName.equals(world.getName()))return arena;
